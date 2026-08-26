@@ -1,0 +1,15 @@
+services:
+  tempest-etp:
+    image: ghcr.io/anobli/tempest-etp:main
+    # host networking is required to receive Tempest UDP broadcasts (port 50222)
+    network_mode: host
+    restart: unless-stopped
+    environment:
+      # --- Location settings (required for accurate ETP) ---
+      LATITUDE: ${LATITUDE:-48.8566}       # decimal degrees, positive = North
+      ELEVATION: ${ELEVATION:-100}          # metres above sea level
+      # Height of the Tempest anemometer above ground (metres)
+      ANEMOMETER_HEIGHT: ${ANEMOMETER_HEIGHT:-2.0}
+      DATA_DIR: /data
+    volumes:
+      - ./data:/data
