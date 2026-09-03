@@ -10,6 +10,9 @@ services:
       ELEVATION: ${ELEVATION:-100}          # metres above sea level
       # Height of the Tempest anemometer above ground (metres)
       ANEMOMETER_HEIGHT: ${ANEMOMETER_HEIGHT:-2.0}
+      HTTP_PORT: ${HTTP_PORT:-8080}
+      # IANA timezone for CSV export day boundaries, e.g. Europe/Paris
+      TIMEZONE: ${TIMEZONE:-Europe/Paris}
       DATA_DIR: /data
     volumes:
       - ./data:/data

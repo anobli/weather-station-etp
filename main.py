@@ -2,12 +2,14 @@ import logging
 import os
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, JSONResponse, Response
 
+import export
 from calculator import compute_etp
 from database import Database
 from listener import TempestListener
@@ -22,6 +24,12 @@ LATITUDE          = float(os.environ.get("LATITUDE", "48.8566"))
 ELEVATION         = float(os.environ.get("ELEVATION", "100"))
 ANEMOMETER_HEIGHT = float(os.environ.get("ANEMOMETER_HEIGHT", "2.0"))
 DATA_DIR          = os.environ.get("DATA_DIR", "/data")
+
+try:
+    TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
+except ZoneInfoNotFoundError:
+    logger.warning("Unknown TIMEZONE=%r, falling back to UTC", os.environ.get("TIMEZONE"))
+    TZ = ZoneInfo("UTC")
 
 db       = Database(f"{DATA_DIR}/observations.db")
 listener = TempestListener(db)
@@ -123,6 +131,34 @@ def latest_obs():
     }
 
 
+def _csv_response(rows: list[dict], filename: str) -> Response:
+    return Response(
+        content=export.rows_to_csv(rows, TZ),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+@app.get("/api/export/daily")
+def export_daily():
+    """CSV of yesterday's observations, local midnight to midnight."""
+    yesterday = datetime.now(TZ).date() - timedelta(days=1)
+    start_ts, end_ts = export.local_day_bounds(yesterday, TZ)
+    rows = db.get_range(start_ts, end_ts)
+    return _csv_response(rows, f"tempest-{yesterday.isoformat()}.csv")
+
+
+@app.get("/api/export/range")
+def export_range(start: date, end: date):
+    """CSV of observations between two local calendar dates (inclusive)."""
+    if end < start:
+        raise HTTPException(status_code=400, detail="end date must be on or after start date")
+    start_ts, _ = export.local_day_bounds(start, TZ)
+    _, end_ts = export.local_day_bounds(end, TZ)
+    rows = db.get_range(start_ts, end_ts)
+    return _csv_response(rows, f"tempest-{start.isoformat()}_to_{end.isoformat()}.csv")
+
+
 @app.get("/", response_class=HTMLResponse)
 def index():
     return _HTML
@@ -191,6 +227,20 @@ _HTML = """<!DOCTYPE html>
     <thead><tr><th>Computed at (UTC)</th><th>ETP mm/day</th><th>Observations</th></tr></thead>
     <tbody id="hist"><tr><td colspan="3" style="color:#64748b">loading…</td></tr></tbody>
   </table>
+
+  <h2 style="margin-top:2rem">Export Data (CSV)</h2>
+  <div class="card">
+    <a href="/api/export/daily" style="color:#7dd3fc">Download yesterday's data</a>
+    <form action="/api/export/range" method="get" style="margin-top:1rem;display:flex;gap:.75rem;align-items:flex-end;flex-wrap:wrap">
+      <label style="font-size:.75rem;color:#94a3b8">From<br>
+        <input type="date" name="start" required style="margin-top:.3rem">
+      </label>
+      <label style="font-size:.75rem;color:#94a3b8">To<br>
+        <input type="date" name="end" required style="margin-top:.3rem">
+      </label>
+      <button type="submit" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#7dd3fc;color:#0f172a;font-weight:600;cursor:pointer">Download CSV</button>
+    </form>
+  </div>
 
 <script>
 const fmt = v => v != null ? v : '—';

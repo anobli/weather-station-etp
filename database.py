@@ -95,6 +95,14 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    def get_range(self, start_ts: int, end_ts: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM observations WHERE timestamp >= ? AND timestamp < ? ORDER BY timestamp",
+                (start_ts, end_ts),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
     def cleanup_old_observations(self, keep_hours: int = 49):
         cutoff = int(time.time()) - keep_hours * 3600
         with self._conn() as c:
