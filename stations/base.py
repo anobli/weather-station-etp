@@ -1,0 +1,55 @@
+import logging
+import threading
+import time
+from abc import ABC, abstractmethod
+from typing import TypedDict
+
+logger = logging.getLogger(__name__)
+
+
+class Observation(TypedDict):
+    """Normalised observation every station driver must produce (SI units)."""
+    timestamp:       int           # epoch seconds UTC
+    temperature:     float         # air temperature (°C)
+    humidity:        float         # relative humidity (%)
+    wind_speed:      float | None  # wind average (m/s)
+    solar_radiation: float | None  # global solar radiation (W/m²)
+    pressure:        float | None  # station pressure (hPa)
+
+
+class WeatherStationListener(ABC):
+    """Base class for weather station drivers.
+
+    Owns the background thread and DB persistence; a driver only implements
+    `_run()`, which loops until `self._stop` is set and calls `publish()`
+    for each observation it decodes.
+    """
+
+    name: str = "station"
+
+    def __init__(self, db):
+        self.db = db
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self.last_seen: float | None = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True, name=f"{self.name}-listener")
+        self._thread.start()
+        logger.info("%s listener started", self.name)
+
+    def stop(self):
+        self._stop.set()
+
+    @abstractmethod
+    def _run(self):
+        """Blocking receive loop; must return promptly once `self._stop` is set."""
+
+    def publish(self, record: Observation):
+        if record.get("temperature") is None or record.get("humidity") is None:
+            return
+        try:
+            self.db.insert_observation(record)
+            self.last_seen = time.time()
+        except Exception as e:
+            logger.error("DB insert error: %s", e)

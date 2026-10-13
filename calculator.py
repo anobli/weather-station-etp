@@ -1,7 +1,7 @@
 """
 FAO-56 Penman-Monteith reference evapotranspiration (daily, mm/day).
 
-Applied to a rolling 24-hour window of observations from a Tempest station.
+Applied to a rolling 24-hour window of observations from a weather station.
 Reference: Allen et al., FAO Irrigation and Drainage Paper No. 56 (1998).
 """
 

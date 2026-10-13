@@ -6,7 +6,7 @@ on:
     tags: ["v*"]
 
 env:
-  IMAGE: ghcr.io/anobli/tempest-etp
+  IMAGE: ghcr.io/anobli/weather-station-etp
 
 jobs:
   build:

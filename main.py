@@ -12,7 +12,7 @@ from fastapi.responses import HTMLResponse, JSONResponse, Response
 import export
 from calculator import compute_etp
 from database import Database
-from listener import TempestListener
+from stations import create_listener
 
 logging.basicConfig(
     level=logging.INFO,
@@ -24,6 +24,7 @@ LATITUDE          = float(os.environ.get("LATITUDE", "48.8566"))
 ELEVATION         = float(os.environ.get("ELEVATION", "100"))
 ANEMOMETER_HEIGHT = float(os.environ.get("ANEMOMETER_HEIGHT", "2.0"))
 DATA_DIR          = os.environ.get("DATA_DIR", "/data")
+STATION_TYPE      = os.environ.get("STATION_TYPE", "tempest")
 
 try:
     TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
@@ -32,7 +33,7 @@ except ZoneInfoNotFoundError:
     TZ = ZoneInfo("UTC")
 
 db       = Database(f"{DATA_DIR}/observations.db")
-listener = TempestListener(db)
+listener = create_listener(STATION_TYPE, db)
 sched    = BackgroundScheduler()
 
 
@@ -65,7 +66,7 @@ async def lifespan(app: FastAPI):
     listener.stop()
 
 
-app = FastAPI(title="Tempest ETP", lifespan=lifespan)
+app = FastAPI(title="Weather Station ETP", lifespan=lifespan)
 
 
 def _iso(ts: int | None) -> str | None:
@@ -79,6 +80,7 @@ def health():
     connected = last_ts is not None and (time.time() - last_ts) < 120
     return {
         "status": "ok",
+        "station_type": listener.name,
         "station_connected": connected,
         "last_observation_at": _iso(last_ts),
         "latitude": LATITUDE,
@@ -145,7 +147,7 @@ def export_daily():
     yesterday = datetime.now(TZ).date() - timedelta(days=1)
     start_ts, end_ts = export.local_day_bounds(yesterday, TZ)
     rows = db.get_range(start_ts, end_ts)
-    return _csv_response(rows, f"tempest-{yesterday.isoformat()}.csv")
+    return _csv_response(rows, f"weather-station-{yesterday.isoformat()}.csv")
 
 
 @app.get("/api/export/range")
@@ -156,7 +158,7 @@ def export_range(start: date, end: date):
     start_ts, _ = export.local_day_bounds(start, TZ)
     _, end_ts = export.local_day_bounds(end, TZ)
     rows = db.get_range(start_ts, end_ts)
-    return _csv_response(rows, f"tempest-{start.isoformat()}_to_{end.isoformat()}.csv")
+    return _csv_response(rows, f"weather-station-{start.isoformat()}_to_{end.isoformat()}.csv")
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -169,7 +171,7 @@ _HTML = """<!DOCTYPE html>
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>Tempest ETP</title>
+  <title>Weather Station ETP</title>
   <style>
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body  { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }
@@ -190,7 +192,7 @@ _HTML = """<!DOCTYPE html>
   </style>
 </head>
 <body>
-  <h1>Tempest ETP Monitor</h1>
+  <h1>Weather Station ETP Monitor</h1>
   <div class="grid">
     <div class="card">
       <div class="lbl">ETP — rolling 24 h</div>

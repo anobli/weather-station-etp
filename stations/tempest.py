@@ -1,35 +1,31 @@
 import json
 import logging
 import socket
-import threading
 import time
+
+from .base import Observation, WeatherStationListener
 
 logger = logging.getLogger(__name__)
 
 TEMPEST_UDP_PORT = 50222
 
 
-class TempestListener:
-    def __init__(self, db):
-        self.db = db
-        self._stop = threading.Event()
-        self._thread: threading.Thread | None = None
-        self.last_seen: float | None = None
+class TempestListener(WeatherStationListener):
+    """WeatherFlow Tempest, via the hub's local UDP broadcast API."""
 
-    def start(self):
-        self._thread = threading.Thread(target=self._listen, daemon=True, name="tempest-udp")
-        self._thread.start()
-        logger.info("Tempest UDP listener started on port %d", TEMPEST_UDP_PORT)
+    name = "tempest"
 
-    def stop(self):
-        self._stop.set()
+    def __init__(self, db, port: int = TEMPEST_UDP_PORT):
+        super().__init__(db)
+        self.port = port
 
-    def _listen(self):
+    def _run(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         sock.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
-        sock.bind(("0.0.0.0", TEMPEST_UDP_PORT))
+        sock.bind(("0.0.0.0", self.port))
         sock.settimeout(1.0)
+        logger.info("Listening for Tempest UDP broadcasts on port %d", self.port)
 
         while not self._stop.is_set():
             try:
@@ -56,7 +52,7 @@ class TempestListener:
                 continue
 
             # WeatherFlow obs_st array layout (indices per API docs)
-            record = {
+            record: Observation = {
                 "timestamp":       obs[0],   # epoch seconds UTC
                 "wind_speed":      obs[2],   # wind avg (m/s)
                 "pressure":        obs[6],   # station pressure (hPa/MB)
@@ -64,12 +60,4 @@ class TempestListener:
                 "humidity":        obs[8],   # relative humidity (%)
                 "solar_radiation": obs[11],  # solar radiation (W/m²)
             }
-
-            if record["temperature"] is None or record["humidity"] is None:
-                continue
-
-            try:
-                self.db.insert_observation(record)
-                self.last_seen = time.time()
-            except Exception as e:
-                logger.error("DB insert error: %s", e)
+            self.publish(record)
