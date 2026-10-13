@@ -14,7 +14,8 @@ services:
       HTTP_PORT: ${HTTP_PORT:-8080}
       # IANA timezone for CSV export day boundaries, e.g. Europe/Paris
       TIMEZONE: ${TIMEZONE:-Europe/Paris}
-      # Weather station driver (see stations/__init__.py): tempest | ecowitt
+      # Weather station driver(s) (see stations/__init__.py): tempest | ecowitt
+      # Comma-separate to run several at once (one DB + ETP each), e.g. tempest,ecowitt
       STATION_TYPE: ${STATION_TYPE:-tempest}
       # Ecowitt only: port the gateway's "Customized" upload (Ecowitt protocol)
       # posts to, and optional PASSKEY filter (logged on first upload)
