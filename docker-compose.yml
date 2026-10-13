@@ -1,6 +1,11 @@
 services:
   weather-station-etp:
     image: ghcr.io/anobli/weather-station-etp:main
+    # `docker compose up -d` always checks GHCR for a newer :main
+    pull_policy: always
+    labels:
+      # opt in to auto-update by the watchtower service below
+      com.centurylinklabs.watchtower.enable: "true"
     # host networking is required to receive station traffic
     # (Tempest UDP broadcast on 50222, Ecowitt HTTP upload on ECOWITT_PORT)
     network_mode: host
@@ -24,3 +29,17 @@ services:
       DATA_DIR: /data
     volumes:
       - ./data:/data
+
+  # Polls GHCR and redeploys weather-station-etp when a new :main image is
+  # published by CI. Scoped by label, so other containers on the host are
+  # left alone. nickfedor/watchtower is the maintained fork of the archived
+  # containrrr/watchtower (which also breaks on Docker Engine >= 29).
+  watchtower:
+    image: nickfedor/watchtower:latest
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      WATCHTOWER_LABEL_ENABLE: "true"
+      WATCHTOWER_CLEANUP: "true"          # remove the superseded image
+      WATCHTOWER_POLL_INTERVAL: ${WATCHTOWER_POLL_INTERVAL:-300}  # seconds
