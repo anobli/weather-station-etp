@@ -1,9 +1,11 @@
 from .base import Observation, WeatherStationListener
+from .ecowitt import EcowittListener
 from .tempest import TempestListener
 
 # STATION_TYPE value -> driver class. Register new drivers here.
 DRIVERS: dict[str, type[WeatherStationListener]] = {
     TempestListener.name: TempestListener,
+    EcowittListener.name: EcowittListener,
 }
 
 
@@ -17,4 +19,4 @@ def create_listener(station_type: str, db) -> WeatherStationListener:
     return cls(db)
 
 
-__all__ = ["Observation", "WeatherStationListener", "TempestListener", "DRIVERS", "create_listener"]
+__all__ = ["Observation", "WeatherStationListener", "TempestListener", "EcowittListener", "DRIVERS", "create_listener"]

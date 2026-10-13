@@ -1,7 +1,8 @@
 services:
   weather-station-etp:
     image: ghcr.io/anobli/weather-station-etp:main
-    # host networking is required to receive station broadcasts (e.g. Tempest UDP port 50222)
+    # host networking is required to receive station traffic
+    # (Tempest UDP broadcast on 50222, Ecowitt HTTP upload on ECOWITT_PORT)
     network_mode: host
     restart: unless-stopped
     environment:
@@ -13,8 +14,12 @@ services:
       HTTP_PORT: ${HTTP_PORT:-8080}
       # IANA timezone for CSV export day boundaries, e.g. Europe/Paris
       TIMEZONE: ${TIMEZONE:-Europe/Paris}
-      # Weather station driver (see stations/__init__.py): tempest
+      # Weather station driver (see stations/__init__.py): tempest | ecowitt
       STATION_TYPE: ${STATION_TYPE:-tempest}
+      # Ecowitt only: port the gateway's "Customized" upload (Ecowitt protocol)
+      # posts to, and optional PASSKEY filter (logged on first upload)
+      ECOWITT_PORT: ${ECOWITT_PORT:-8090}
+      ECOWITT_PASSKEY: ${ECOWITT_PASSKEY:-}
       DATA_DIR: /data
     volumes:
       - ./data:/data
