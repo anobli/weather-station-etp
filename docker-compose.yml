@@ -19,13 +19,19 @@ services:
       HTTP_PORT: ${HTTP_PORT:-8080}
       # IANA timezone for CSV export day boundaries, e.g. Europe/Paris
       TIMEZONE: ${TIMEZONE:-Europe/Paris}
-      # Weather station driver(s) (see stations/__init__.py): tempest | ecowitt
+      # Weather station driver(s) (see stations/__init__.py): tempest | ecowitt | pwsweather
       # Comma-separate to run several at once (one DB + ETP each), e.g. tempest,ecowitt
       STATION_TYPE: ${STATION_TYPE:-tempest}
       # Ecowitt only: port the gateway's "Customized" upload (Ecowitt protocol)
       # posts to, and optional PASSKEY filter (logged on first upload)
       ECOWITT_PORT: ${ECOWITT_PORT:-8090}
       ECOWITT_PASSKEY: ${ECOWITT_PASSKEY:-}
+      # PWSWeather only: station + Xweather/AerisWeather API credentials
+      # (https://www.xweather.com/), polled every PWSWEATHER_POLL_SECONDS
+      PWSWEATHER_STATION_ID: ${PWSWEATHER_STATION_ID:-}
+      PWSWEATHER_CLIENT_ID: ${PWSWEATHER_CLIENT_ID:-}
+      PWSWEATHER_CLIENT_SECRET: ${PWSWEATHER_CLIENT_SECRET:-}
+      PWSWEATHER_POLL_SECONDS: ${PWSWEATHER_POLL_SECONDS:-300}
       DATA_DIR: /data
     volumes:
       - ./data:/data

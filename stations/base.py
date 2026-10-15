@@ -26,6 +26,9 @@ class WeatherStationListener(ABC):
     """
 
     name: str = "station"
+    # Seconds since the last observation after which a station is considered
+    # disconnected; override for drivers that poll on a longer interval.
+    stale_after: float = 120
 
     def __init__(self, db):
         self.db = db

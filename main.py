@@ -24,7 +24,7 @@ LATITUDE          = float(os.environ.get("LATITUDE", "48.8566"))
 ELEVATION         = float(os.environ.get("ELEVATION", "100"))
 ANEMOMETER_HEIGHT = float(os.environ.get("ANEMOMETER_HEIGHT", "2.0"))
 DATA_DIR          = os.environ.get("DATA_DIR", "/data")
-# Comma-separated list, e.g. "tempest,ecowitt"; the first one is the API default.
+# Comma-separated list, e.g. "tempest,ecowitt,pwsweather"; the first one is the API default.
 STATION_TYPES     = list(dict.fromkeys(
     s.strip().lower() for s in os.environ.get("STATION_TYPE", "tempest").split(",") if s.strip()
 ))
@@ -110,7 +110,7 @@ def _station_status(st: WeatherStationListener) -> dict:
     last_ts = obs["timestamp"] if obs else None
     return {
         "station_type": st.name,
-        "station_connected": last_ts is not None and (time.time() - last_ts) < 120,
+        "station_connected": last_ts is not None and (time.time() - last_ts) < st.stale_after,
         "last_observation_at": _iso(last_ts),
     }
 
