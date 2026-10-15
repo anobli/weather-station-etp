@@ -37,7 +37,13 @@ class PWSWeatherListener(WeatherStationListener):
     def __init__(self, db, station_id: str | None = None, client_id: str | None = None,
                  client_secret: str | None = None, poll_seconds: int | None = None):
         super().__init__(db)
-        self.station_id = station_id or os.environ.get("PWSWEATHER_STATION_ID")
+        station_id = station_id or os.environ.get("PWSWEATHER_STATION_ID")
+        # Xweather expects PWSWeather station ids prefixed with "PWS_"
+        # (e.g. PWS_KAZMTPHX); add it if the configured id doesn't have it.
+        self.station_id = (
+            station_id if station_id is None or station_id.upper().startswith("PWS_")
+            else f"PWS_{station_id}"
+        )
         self.client_id = client_id or os.environ.get("PWSWEATHER_CLIENT_ID")
         self.client_secret = client_secret or os.environ.get("PWSWEATHER_CLIENT_SECRET")
         if not self.client_id or not self.client_secret:
@@ -66,7 +72,7 @@ class PWSWeatherListener(WeatherStationListener):
                 break
 
     def _poll(self):
-        url = f"{API_BASE}/PWS_{quote(self.station_id)}?" + urlencode({
+        url = f"{API_BASE}/{quote(self.station_id)}?" + urlencode({
             "client_id": self.client_id,
             "client_secret": self.client_secret,
         })
