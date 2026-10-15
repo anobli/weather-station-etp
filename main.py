@@ -27,6 +27,11 @@ LATITUDE          = float(os.environ.get("LATITUDE", "48.8566"))
 ELEVATION         = float(os.environ.get("ELEVATION", "100"))
 ANEMOMETER_HEIGHT = float(os.environ.get("ANEMOMETER_HEIGHT", "2.0"))
 DATA_DIR          = os.environ.get("DATA_DIR", "/data")
+# How long raw per-minute observations are kept before being purged. Default
+# 90 days (2160h) so new ET0 methods can be recomputed over real history
+# instead of only starting from whenever they were added — SQLite storage
+# cost for this is trivial (a few MB/station over that window).
+OBSERVATION_RETENTION_HOURS = int(os.environ.get("OBSERVATION_RETENTION_HOURS", "2160"))
 # Comma-separated list, e.g. "tempest,ecowitt,pwsweather"; the first one is the API default.
 STATION_TYPES     = list(dict.fromkeys(
     s.strip().lower() for s in os.environ.get("STATION_TYPE", "tempest").split(",") if s.strip()
@@ -84,7 +89,7 @@ def run_etp():
 
 def run_cleanup():
     for st in stations.values():
-        st.db.cleanup_old_observations(keep_hours=49)
+        st.db.cleanup_old_observations(keep_hours=OBSERVATION_RETENTION_HOURS)
 
 
 @asynccontextmanager
