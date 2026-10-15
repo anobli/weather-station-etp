@@ -1,8 +1,17 @@
 """
-FAO-56 Penman-Monteith reference evapotranspiration (daily, mm/day).
+Reference evapotranspiration (ET0, daily, mm/day), computed by several
+methods over the same rolling 24-hour window so they can be compared:
 
-Applied to a rolling 24-hour window of observations from a weather station.
-Reference: Allen et al., FAO Irrigation and Drainage Paper No. 56 (1998).
+- Penman-Monteith (FAO-56): the primary/most accurate method, combining
+  radiation, humidity and wind. Reference: Allen et al., FAO Irrigation
+  and Drainage Paper No. 56 (1998).
+- Hargreaves-Samani (1985): temperature + extraterrestrial radiation only,
+  no wind/humidity/solar sensor needed — the usual fallback when those
+  aren't available or trusted.
+- Priestley-Taylor (1972): net radiation driven, drops the aerodynamic
+  (wind) term entirely.
+- Makkink (1957): solar radiation + temperature only, simpler than
+  Priestley-Taylor since it skips net longwave radiation.
 """
 
 import math
@@ -98,8 +107,21 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     ET0 = (
         0.408 * delta * Rn + gamma * (900 / (T_mean + 273)) * u2 * (es - ea)
     ) / (delta + gamma * (1 + 0.34 * u2))
-
     ET0 = max(ET0, 0.0)
+
+    # MJ/m²/day -> mm/day: divide by the latent heat of vaporisation λ
+    # (≈2.45 MJ/kg at ~20°C), i.e. multiply by 1/λ = 0.408.
+    MJ_TO_MM = 0.408
+
+    # Hargreaves-Samani (1985): no radiation/humidity/wind sensor needed.
+    ET0_hs = max(0.0023 * (T_mean + 17.8) * math.sqrt(max(T_max - T_min, 0.0)) * Ra * MJ_TO_MM, 0.0)
+
+    # Priestley-Taylor (1972): drops the aerodynamic (wind) term; α=1.26
+    # is the standard coefficient for well-watered reference vegetation.
+    ET0_pt = max(1.26 * (delta / (delta + gamma)) * Rn * MJ_TO_MM, 0.0)
+
+    # Makkink (1957): radiation + temperature only, c=0.61 standard coefficient.
+    ET0_mk = max(0.61 * (delta / (delta + gamma)) * Rs * MJ_TO_MM - 0.12, 0.0)
 
     return {
         "computed_at":       int(time.time()),
@@ -107,4 +129,9 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
         "window_end":        max(timestamps),
         "et0_mm":            round(ET0, 3),
         "observation_count": len(obs),
+        "et0_alt_mm": {
+            "hargreaves_samani": round(ET0_hs, 3),
+            "priestley_taylor":  round(ET0_pt, 3),
+            "makkink":           round(ET0_mk, 3),
+        },
     }

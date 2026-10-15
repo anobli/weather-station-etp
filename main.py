@@ -73,8 +73,9 @@ def run_etp():
             result = compute_etp(st.db, LATITUDE, ELEVATION, ANEMOMETER_HEIGHT)
             if result:
                 st.db.store_etp(result)
-                logger.info("[%s] ETP %.3f mm/day (%d obs)",
-                            name, result["et0_mm"], result["observation_count"])
+                alt = ", ".join(f"{m}={v:.3f}" for m, v in result["et0_alt_mm"].items())
+                logger.info("[%s] ETP penman_monteith=%.3f mm/day (%d obs) %s",
+                            name, result["et0_mm"], result["observation_count"], alt)
             else:
                 logger.warning("[%s] Insufficient observations for ETP computation", name)
         except Exception:
@@ -145,6 +146,7 @@ def current_etp(station: str | None = None):
         "window_start":     _iso(r["window_start"]),
         "window_end":       _iso(r["window_end"]),
         "et0_mm_per_day":   r["et0_mm"],
+        "et0_alt_mm_per_day": r["et0_alt_mm"],
         "observation_count": r["observation_count"],
     }
 
@@ -157,6 +159,7 @@ def etp_history(limit: int = 48, station: str | None = None):
             {
                 "computed_at":      _iso(r["computed_at"]),
                 "et0_mm_per_day":   r["et0_mm"],
+                "et0_alt_mm_per_day": r["et0_alt_mm"],
                 "observation_count": r["observation_count"],
             }
             for r in rows
@@ -277,6 +280,12 @@ _HTML = """<!DOCTYPE html>
     </div>
   </div>
 
+  <h2>Compare ETP Methods — current window</h2>
+  <table style="margin-bottom:2rem">
+    <thead><tr><th>Method</th><th>ETP mm/day</th><th>Δ vs Penman-Monteith</th></tr></thead>
+    <tbody id="methods"><tr><td colspan="3" style="color:#64748b">loading…</td></tr></tbody>
+  </table>
+
   <h2>ETP History — last 48 computations</h2>
   <table>
     <thead><tr><th>Computed at (UTC)</th><th>ETP mm/day</th><th>Observations</th></tr></thead>
@@ -330,6 +339,7 @@ function selectStation() {
     document.getElementById(id).innerHTML = `—<span class="unit">${unit}</span>`;
   document.getElementById('etp-sub').textContent = 'awaiting data…';
   document.getElementById('last-seen').textContent = '';
+  document.getElementById('methods').innerHTML = '<tr><td colspan="3" style="color:#64748b">loading…</td></tr>';
   refresh();
 }
 
@@ -347,6 +357,23 @@ async function refresh() {
       `${etp.et0_mm_per_day.toFixed(2)}<span class="unit">mm/day</span>`;
     document.getElementById('etp-sub').textContent =
       `Computed: ${fmtDt(etp.computed_at)}`;
+
+    const methodLabel = {
+      hargreaves_samani: 'Hargreaves-Samani',
+      priestley_taylor:  'Priestley-Taylor',
+      makkink:           'Makkink',
+    };
+    const rows = [['Penman-Monteith (reference)', etp.et0_mm_per_day, 0]];
+    for (const [key, val] of Object.entries(etp.et0_alt_mm_per_day || {})) {
+      rows.push([methodLabel[key] || key, val, val - etp.et0_mm_per_day]);
+    }
+    document.getElementById('methods').innerHTML = rows.map(([label, val, delta]) =>
+      `<tr>
+        <td>${label}</td>
+        <td>${val.toFixed(3)}</td>
+        <td>${delta === 0 ? '—' : (delta > 0 ? '+' : '') + delta.toFixed(3)}</td>
+      </tr>`
+    ).join('');
   }
 
   if (obs) {

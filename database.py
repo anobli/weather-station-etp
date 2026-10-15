@@ -1,3 +1,4 @@
+import json
 import sqlite3
 import time
 from contextlib import contextmanager
@@ -39,10 +40,15 @@ class Database:
                     window_start    INTEGER NOT NULL,
                     window_end      INTEGER NOT NULL,
                     et0_mm          REAL NOT NULL,
-                    observation_count INTEGER
+                    observation_count INTEGER,
+                    et0_alt_mm      TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_etp_ts ON etp_results(computed_at);
             """)
+            # Migration for DBs created before et0_alt_mm existed.
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(etp_results)")}
+            if "et0_alt_mm" not in columns:
+                c.execute("ALTER TABLE etp_results ADD COLUMN et0_alt_mm TEXT")
 
     def insert_observation(self, obs: dict):
         with self._conn() as c:
@@ -74,18 +80,24 @@ class Database:
         with self._conn() as c:
             c.execute(
                 """INSERT INTO etp_results
-                   (computed_at, window_start, window_end, et0_mm, observation_count)
-                   VALUES (?, ?, ?, ?, ?)""",
+                   (computed_at, window_start, window_end, et0_mm, observation_count, et0_alt_mm)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
                 (result["computed_at"], result["window_start"], result["window_end"],
-                 result["et0_mm"], result["observation_count"]),
+                 result["et0_mm"], result["observation_count"],
+                 json.dumps(result.get("et0_alt_mm")) if result.get("et0_alt_mm") else None),
             )
+
+    @staticmethod
+    def _decode_etp(row: dict) -> dict:
+        row["et0_alt_mm"] = json.loads(row["et0_alt_mm"]) if row.get("et0_alt_mm") else {}
+        return row
 
     def get_latest_etp(self) -> dict | None:
         with self._conn() as c:
             row = c.execute(
                 "SELECT * FROM etp_results ORDER BY computed_at DESC LIMIT 1"
             ).fetchone()
-        return dict(row) if row else None
+        return self._decode_etp(dict(row)) if row else None
 
     def get_etp_history(self, limit: int = 48) -> list[dict]:
         with self._conn() as c:
@@ -93,7 +105,7 @@ class Database:
                 "SELECT * FROM etp_results ORDER BY computed_at DESC LIMIT ?",
                 (limit,),
             ).fetchall()
-        return [dict(r) for r in rows]
+        return [self._decode_etp(dict(r)) for r in rows]
 
     def get_range(self, start_ts: int, end_ts: int) -> list[dict]:
         with self._conn() as c:
