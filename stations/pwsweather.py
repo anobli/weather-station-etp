@@ -66,7 +66,7 @@ class PWSWeatherListener(WeatherStationListener):
                 break
 
     def _poll(self):
-        url = f"{API_BASE}/{quote(self.station_id)}?" + urlencode({
+        url = f"{API_BASE}/PWS_{quote(self.station_id)}?" + urlencode({
             "client_id": self.client_id,
             "client_secret": self.client_secret,
         })
