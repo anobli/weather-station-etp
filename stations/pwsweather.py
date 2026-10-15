@@ -11,9 +11,17 @@ logger = logging.getLogger(__name__)
 
 # PWSWeather station data is served through Xweather (formerly AerisWeather),
 # the API provider behind the PWSWeather network. Requires a developer
-# account: https://www.xweather.com/ -> client_id/client_secret.
+# account: https://www.xweather.com/ -> client_id/client_secret, issued by
+# self-serve trial signups as a single "API key" shaped CLIENTID_SECRET.
 API_BASE = "https://data.api.xweather.com/observations"
 POLL_SECONDS_DEFAULT = 300
+
+
+def _split_api_key(key: str) -> tuple[str, str]:
+    client_id, _, client_secret = key.partition("_")
+    if not client_id or not client_secret:
+        raise ValueError("PWSWEATHER_API_KEY must be in CLIENTID_CLIENTSECRET form")
+    return client_id, client_secret
 
 
 class PWSWeatherListener(WeatherStationListener):
@@ -32,12 +40,19 @@ class PWSWeatherListener(WeatherStationListener):
         self.station_id = station_id or os.environ.get("PWSWEATHER_STATION_ID")
         self.client_id = client_id or os.environ.get("PWSWEATHER_CLIENT_ID")
         self.client_secret = client_secret or os.environ.get("PWSWEATHER_CLIENT_SECRET")
+        if not self.client_id or not self.client_secret:
+            api_key = os.environ.get("PWSWEATHER_API_KEY")
+            if api_key:
+                self.client_id, self.client_secret = _split_api_key(api_key)
         self.poll_seconds = poll_seconds or int(os.environ.get("PWSWEATHER_POLL_SECONDS", POLL_SECONDS_DEFAULT))
         self.stale_after = self.poll_seconds * 2 + 60
         if not self.station_id:
             raise ValueError("PWSWEATHER_STATION_ID is required for the pwsweather driver")
         if not self.client_id or not self.client_secret:
-            raise ValueError("PWSWEATHER_CLIENT_ID/PWSWEATHER_CLIENT_SECRET are required for the pwsweather driver")
+            raise ValueError(
+                "pwsweather driver needs either PWSWEATHER_API_KEY (CLIENTID_SECRET form) "
+                "or PWSWEATHER_CLIENT_ID + PWSWEATHER_CLIENT_SECRET"
+            )
         self._last_timestamp: int | None = None
 
     def _run(self):

@@ -27,10 +27,12 @@ services:
       ECOWITT_PORT: ${ECOWITT_PORT:-8090}
       ECOWITT_PASSKEY: ${ECOWITT_PASSKEY:-}
       # PWSWeather only: station + Xweather/AerisWeather API credentials
-      # (https://www.xweather.com/), polled every PWSWEATHER_POLL_SECONDS
+      # (https://www.xweather.com/), polled every PWSWEATHER_POLL_SECONDS.
+      # Trial signups issue a single "API key" shaped CLIENTID_SECRET -> put
+      # it whole in PWSWEATHER_API_KEY. If you have a separate client_id and
+      # client_secret instead, set PWSWEATHER_CLIENT_ID/_CLIENT_SECRET.
       PWSWEATHER_STATION_ID: ${PWSWEATHER_STATION_ID:-}
-      PWSWEATHER_CLIENT_ID: ${PWSWEATHER_CLIENT_ID:-}
-      PWSWEATHER_CLIENT_SECRET: ${PWSWEATHER_CLIENT_SECRET:-}
+      PWSWEATHER_API_KEY: ${PWSWEATHER_API_KEY:-}
       PWSWEATHER_POLL_SECONDS: ${PWSWEATHER_POLL_SECONDS:-300}
       DATA_DIR: /data
     volumes:
