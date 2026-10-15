@@ -20,6 +20,9 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+GIT_SHA = os.environ.get("GIT_SHA", "unknown")
+logger.info("Starting weather-station-etp, commit=%s", GIT_SHA)
+
 LATITUDE          = float(os.environ.get("LATITUDE", "48.8566"))
 ELEVATION         = float(os.environ.get("ELEVATION", "100"))
 ANEMOMETER_HEIGHT = float(os.environ.get("ANEMOMETER_HEIGHT", "2.0"))
@@ -124,6 +127,7 @@ def list_stations():
 def health(station: str | None = None):
     return {
         "status": "ok",
+        "commit": GIT_SHA,
         **_station_status(_station(station)),
         "latitude": LATITUDE,
         "elevation_m": ELEVATION,
