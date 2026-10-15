@@ -107,10 +107,19 @@ class Database:
             ).fetchall()
         return [self._decode_etp(dict(r)) for r in rows]
 
-    def get_etp_all(self) -> list[dict]:
-        """Every hourly ETP computation ever stored (never purged), oldest first."""
+    def get_etp_range(self, start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
+        """Hourly ETP computations (never purged) between start_ts (inclusive) and
+        end_ts (exclusive); unbounded on either side when None. Oldest first."""
+        query, params = "SELECT * FROM etp_results WHERE 1=1", []
+        if start_ts is not None:
+            query += " AND computed_at >= ?"
+            params.append(start_ts)
+        if end_ts is not None:
+            query += " AND computed_at < ?"
+            params.append(end_ts)
+        query += " ORDER BY computed_at ASC"
         with self._conn() as c:
-            rows = c.execute("SELECT * FROM etp_results ORDER BY computed_at ASC").fetchall()
+            rows = c.execute(query, params).fetchall()
         return [self._decode_etp(dict(r)) for r in rows]
 
     def get_range(self, start_ts: int, end_ts: int) -> list[dict]:

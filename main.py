@@ -168,11 +168,16 @@ def etp_history(limit: int = 48, station: str | None = None):
 
 
 @app.get("/api/etp/daily")
-def etp_daily(station: str | None = None):
+def etp_daily(station: str | None = None, start: date | None = None, end: date | None = None):
     """One point per local calendar day, averaging that day's hourly rolling-24h
     computations (etp_results is never purged, so this covers the station's
-    whole history, not just the last 49h of raw observations)."""
-    rows = _station(station).db.get_etp_all()
+    whole history, not just the last 49h of raw observations). `start`/`end`
+    (local calendar dates, inclusive) optionally restrict the range."""
+    if start and end and end < start:
+        raise HTTPException(status_code=400, detail="end date must be on or after start date")
+    start_ts = export.local_day_bounds(start, TZ)[0] if start else None
+    end_ts = export.local_day_bounds(end, TZ)[1] if end else None
+    rows = _station(station).db.get_etp_range(start_ts, end_ts)
 
     days: dict[str, dict] = {}
     for r in rows:
@@ -280,6 +285,12 @@ _HTML = """<!DOCTYPE html>
 <body>
   <h1>Weather Station ETP Monitor</h1>
   <nav class="tabs" id="tabs" hidden></nav>
+  <nav class="tabs" id="view-tabs">
+    <button class="tab active" data-view="overview">Overview</button>
+    <button class="tab" data-view="chart">Daily ETP Chart</button>
+  </nav>
+
+  <div id="view-overview">
   <div class="grid">
     <div class="card">
       <div class="lbl">ETP — rolling 24 h</div>
@@ -317,13 +328,6 @@ _HTML = """<!DOCTYPE html>
     <tbody id="methods"><tr><td colspan="3" style="color:#64748b">loading…</td></tr></tbody>
   </table>
 
-  <h2>Daily ETP by Method</h2>
-  <div class="card" style="margin-bottom:2rem">
-    <canvas id="daily-chart" height="260" style="width:100%;max-width:100%"></canvas>
-    <div id="daily-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
-    <div class="sub" style="margin-top:.5rem">Each point averages that day's hourly rolling-24h computations.</div>
-  </div>
-
   <h2>ETP History — last 48 computations</h2>
   <table>
     <thead><tr><th>Computed at (UTC)</th><th>ETP mm/day</th><th>Observations</th></tr></thead>
@@ -343,6 +347,26 @@ _HTML = """<!DOCTYPE html>
       <input type="hidden" name="station" id="export-station">
       <button type="submit" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#7dd3fc;color:#0f172a;font-weight:600;cursor:pointer">Download CSV</button>
     </form>
+  </div>
+  </div>
+
+  <div id="view-chart" hidden>
+  <h2>Daily ETP by Method</h2>
+  <div class="card" style="margin-bottom:2rem">
+    <form id="daily-range" style="display:flex;gap:.75rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:1rem">
+      <label style="font-size:.75rem;color:#94a3b8">From<br>
+        <input type="date" name="start" style="margin-top:.3rem">
+      </label>
+      <label style="font-size:.75rem;color:#94a3b8">To<br>
+        <input type="date" name="end" style="margin-top:.3rem">
+      </label>
+      <button type="submit" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#7dd3fc;color:#0f172a;font-weight:600;cursor:pointer">Apply</button>
+      <button type="button" id="daily-range-clear" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#334155;color:#e2e8f0;cursor:pointer">Full history</button>
+    </form>
+    <canvas id="daily-chart" height="260" style="width:100%;max-width:100%"></canvas>
+    <div id="daily-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
+    <div class="sub" style="margin-top:.5rem">Each point averages that day's hourly rolling-24h computations.</div>
+  </div>
   </div>
 
 <script>
@@ -365,6 +389,8 @@ const methodColor = {
 };
 
 let lastDailyDays = [];
+let dailyStart = '';
+let dailyEnd = '';
 let station = null;
 const q = (path, extra = '') => `${path}?station=${encodeURIComponent(station)}${extra}`;
 
@@ -384,8 +410,41 @@ async function loadStations() {
   selectStation();
 }
 
+document.getElementById('view-tabs').onclick = e => {
+  const view = e.target.dataset.view;
+  if (!view) return;
+  document.querySelectorAll('#view-tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+  document.getElementById('view-overview').hidden = view !== 'overview';
+  document.getElementById('view-chart').hidden = view !== 'chart';
+  if (view === 'chart') drawDailyChart(lastDailyDays);
+};
+
+document.getElementById('daily-range').onsubmit = e => {
+  e.preventDefault();
+  dailyStart = e.target.elements.start.value;
+  dailyEnd = e.target.elements.end.value;
+  loadDaily();
+};
+
+document.getElementById('daily-range-clear').onclick = () => {
+  dailyStart = ''; dailyEnd = '';
+  document.querySelector('#daily-range [name=start]').value = '';
+  document.querySelector('#daily-range [name=end]').value = '';
+  loadDaily();
+};
+
+async function loadDaily() {
+  if (!station) return;
+  let extra = '';
+  if (dailyStart) extra += `&start=${dailyStart}`;
+  if (dailyEnd) extra += `&end=${dailyEnd}`;
+  const daily = await fetch(q('/api/etp/daily', extra)).then(r => r.ok ? r.json() : null).catch(() => null);
+  lastDailyDays = daily?.days || [];
+  drawDailyChart(lastDailyDays);
+}
+
 function selectStation() {
-  document.querySelectorAll('.tab').forEach(t => t.classList.toggle('active', t.dataset.st === station));
+  document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.st === station));
   document.getElementById('export-daily').href = q('/api/export/daily');
   document.getElementById('export-station').value = station;
   // Clear the previous station's values until the new ones arrive.
@@ -394,19 +453,19 @@ function selectStation() {
   document.getElementById('etp-sub').textContent = 'awaiting data…';
   document.getElementById('last-seen').textContent = '';
   document.getElementById('methods').innerHTML = '<tr><td colspan="3" style="color:#64748b">loading…</td></tr>';
-  drawDailyChart([]);
+  loadDaily();
   refresh();
 }
 
 async function refresh() {
   if (!station) return;
-  const [etp, obs, health, hist, daily] = await Promise.all([
+  const [etp, obs, health, hist] = await Promise.all([
     fetch(q('/api/etp/current')).then(r => r.ok ? r.json() : null).catch(() => null),
     fetch(q('/api/observations/latest')).then(r => r.ok ? r.json() : null).catch(() => null),
     fetch(q('/health')).then(r => r.json()).catch(() => ({})),
     fetch(q('/api/etp/history', '&limit=48')).then(r => r.json()).catch(() => ({entries:[]})),
-    fetch(q('/api/etp/daily')).then(r => r.ok ? r.json() : null).catch(() => null),
   ]);
+  loadDaily();
 
   if (etp) {
     document.getElementById('etp').innerHTML =
@@ -456,9 +515,6 @@ async function refresh() {
           <td>${e.observation_count}</td>
         </tr>`
       ).join('');
-
-  lastDailyDays = daily?.days || [];
-  drawDailyChart(lastDailyDays);
 }
 
 function drawDailyChart(days) {
