@@ -107,6 +107,12 @@ class Database:
             ).fetchall()
         return [self._decode_etp(dict(r)) for r in rows]
 
+    def get_etp_all(self) -> list[dict]:
+        """Every hourly ETP computation ever stored (never purged), oldest first."""
+        with self._conn() as c:
+            rows = c.execute("SELECT * FROM etp_results ORDER BY computed_at ASC").fetchall()
+        return [self._decode_etp(dict(r)) for r in rows]
+
     def get_range(self, start_ts: int, end_ts: int) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(

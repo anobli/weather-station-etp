@@ -167,6 +167,37 @@ def etp_history(limit: int = 48, station: str | None = None):
     }
 
 
+@app.get("/api/etp/daily")
+def etp_daily(station: str | None = None):
+    """One point per local calendar day, averaging that day's hourly rolling-24h
+    computations (etp_results is never purged, so this covers the station's
+    whole history, not just the last 49h of raw observations)."""
+    rows = _station(station).db.get_etp_all()
+
+    days: dict[str, dict] = {}
+    for r in rows:
+        day = datetime.fromtimestamp(r["computed_at"], tz=TZ).date().isoformat()
+        bucket = days.setdefault(day, {"et0_mm": [], "et0_alt_mm": {}})
+        bucket["et0_mm"].append(r["et0_mm"])
+        for method, value in r["et0_alt_mm"].items():
+            bucket["et0_alt_mm"].setdefault(method, []).append(value)
+
+    return {
+        "days": [
+            {
+                "date":    day,
+                "et0_mm":  round(sum(b["et0_mm"]) / len(b["et0_mm"]), 3),
+                "et0_alt_mm": {
+                    method: round(sum(values) / len(values), 3)
+                    for method, values in b["et0_alt_mm"].items()
+                },
+                "sample_count": len(b["et0_mm"]),
+            }
+            for day, b in sorted(days.items())
+        ]
+    }
+
+
 @app.get("/api/observations/latest")
 def latest_obs(station: str | None = None):
     obs = _station(station).db.get_latest_observation()
@@ -286,6 +317,13 @@ _HTML = """<!DOCTYPE html>
     <tbody id="methods"><tr><td colspan="3" style="color:#64748b">loading…</td></tr></tbody>
   </table>
 
+  <h2>Daily ETP by Method</h2>
+  <div class="card" style="margin-bottom:2rem">
+    <canvas id="daily-chart" height="260" style="width:100%;max-width:100%"></canvas>
+    <div id="daily-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
+    <div class="sub" style="margin-top:.5rem">Each point averages that day's hourly rolling-24h computations.</div>
+  </div>
+
   <h2>ETP History — last 48 computations</h2>
   <table>
     <thead><tr><th>Computed at (UTC)</th><th>ETP mm/day</th><th>Observations</th></tr></thead>
@@ -311,6 +349,22 @@ _HTML = """<!DOCTYPE html>
 const fmt = v => v != null ? v : '—';
 const fmtDt = iso => iso ? new Date(iso).toLocaleString() : '—';
 
+const methodLabel = {
+  penman_monteith:   'Penman-Monteith',
+  hargreaves_samani: 'Hargreaves-Samani',
+  priestley_taylor:  'Priestley-Taylor',
+  makkink:           'Makkink',
+  turc:              'Turc',
+};
+const methodColor = {
+  penman_monteith:   '#7dd3fc',
+  hargreaves_samani: '#f87171',
+  priestley_taylor:  '#34d399',
+  makkink:           '#fbbf24',
+  turc:              '#c084fc',
+};
+
+let lastDailyDays = [];
 let station = null;
 const q = (path, extra = '') => `${path}?station=${encodeURIComponent(station)}${extra}`;
 
@@ -340,16 +394,18 @@ function selectStation() {
   document.getElementById('etp-sub').textContent = 'awaiting data…';
   document.getElementById('last-seen').textContent = '';
   document.getElementById('methods').innerHTML = '<tr><td colspan="3" style="color:#64748b">loading…</td></tr>';
+  drawDailyChart([]);
   refresh();
 }
 
 async function refresh() {
   if (!station) return;
-  const [etp, obs, health, hist] = await Promise.all([
+  const [etp, obs, health, hist, daily] = await Promise.all([
     fetch(q('/api/etp/current')).then(r => r.ok ? r.json() : null).catch(() => null),
     fetch(q('/api/observations/latest')).then(r => r.ok ? r.json() : null).catch(() => null),
     fetch(q('/health')).then(r => r.json()).catch(() => ({})),
     fetch(q('/api/etp/history', '&limit=48')).then(r => r.json()).catch(() => ({entries:[]})),
+    fetch(q('/api/etp/daily')).then(r => r.ok ? r.json() : null).catch(() => null),
   ]);
 
   if (etp) {
@@ -358,12 +414,6 @@ async function refresh() {
     document.getElementById('etp-sub').textContent =
       `Computed: ${fmtDt(etp.computed_at)}`;
 
-    const methodLabel = {
-      hargreaves_samani: 'Hargreaves-Samani',
-      priestley_taylor:  'Priestley-Taylor',
-      makkink:           'Makkink',
-      turc:              'Turc',
-    };
     const rows = [['Penman-Monteith (reference)', etp.et0_mm_per_day, 0]];
     for (const [key, val] of Object.entries(etp.et0_alt_mm_per_day || {})) {
       rows.push([methodLabel[key] || key, val, val - etp.et0_mm_per_day]);
@@ -406,7 +456,84 @@ async function refresh() {
           <td>${e.observation_count}</td>
         </tr>`
       ).join('');
+
+  lastDailyDays = daily?.days || [];
+  drawDailyChart(lastDailyDays);
 }
+
+function drawDailyChart(days) {
+  const canvas = document.getElementById('daily-chart');
+  const legendEl = document.getElementById('daily-legend');
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth || 600;
+  const H = 260;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.height = H + 'px';
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  legendEl.innerHTML = '';
+
+  if (!days.length) {
+    ctx.fillStyle = '#64748b';
+    ctx.font = '13px system-ui';
+    ctx.fillText('No daily data yet — check back after the next hourly computation.', 12, H / 2);
+    return;
+  }
+
+  const series = { penman_monteith: days.map(d => d.et0_mm) };
+  days.forEach((d, i) => {
+    for (const [method, value] of Object.entries(d.et0_alt_mm)) {
+      (series[method] ??= Array(days.length).fill(null))[i] = value;
+    }
+  });
+
+  const allValues = Object.values(series).flat().filter(v => v != null);
+  const yMax = Math.max(...allValues, 0.1) * 1.1;
+  const pad = { l: 36, r: 12, t: 10, b: 22 };
+  const plotW = W - pad.l - pad.r;
+  const plotH = H - pad.t - pad.b;
+  const xFor = i => pad.l + (days.length === 1 ? plotW / 2 : (i / (days.length - 1)) * plotW);
+  const yFor = v => pad.t + plotH - (v / yMax) * plotH;
+
+  ctx.strokeStyle = '#1e293b';
+  ctx.fillStyle = '#64748b';
+  ctx.font = '11px system-ui';
+  ctx.textAlign = 'right';
+  for (let i = 0; i <= 4; i++) {
+    const v = (yMax / 4) * i;
+    const y = yFor(v);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    ctx.fillText(v.toFixed(1), pad.l - 6, y + 3);
+  }
+
+  ctx.textAlign = 'center';
+  [0, Math.floor((days.length - 1) / 2), days.length - 1].forEach(i => {
+    ctx.fillText(days[i].date, xFor(i), H - 4);
+  });
+
+  for (const [method, values] of Object.entries(series)) {
+    const color = methodColor[method] || '#94a3b8';
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    values.forEach((v, i) => {
+      if (v == null) { started = false; return; }
+      const x = xFor(i), y = yFor(v);
+      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
+    });
+    ctx.stroke();
+
+    const sw = document.createElement('span');
+    sw.innerHTML = `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;` +
+      `background:${color};margin-right:.4rem;vertical-align:middle"></span>${methodLabel[method] || method}`;
+    legendEl.appendChild(sw);
+  }
+}
+
+window.addEventListener('resize', () => drawDailyChart(lastDailyDays));
 
 loadStations();
 setInterval(refresh, 30_000);
