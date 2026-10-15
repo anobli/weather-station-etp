@@ -684,7 +684,7 @@ async function loadBrowse() {
     return;
   }
 
-  tbody.innerHTML = data.rows.map(row =>
+  tbody.innerHTML = data.rows.slice().reverse().map(row =>
     `<tr>${cols.map(([, key, format]) => `<td>${format(row[key])}</td>`).join('')}</tr>`
   ).join('');
   note.textContent = data.total > data.rows.length
