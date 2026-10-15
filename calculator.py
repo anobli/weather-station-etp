@@ -12,6 +12,8 @@ methods over the same rolling 24-hour window so they can be compared:
   (wind) term entirely.
 - Makkink (1957): solar radiation + temperature only, simpler than
   Priestley-Taylor since it skips net longwave radiation.
+- Turc (1961): solar radiation + temperature, with a dryness correction
+  from mean relative humidity. Widely used in French agronomy.
 """
 
 import math
@@ -123,6 +125,12 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     # Makkink (1957): radiation + temperature only, c=0.61 standard coefficient.
     ET0_mk = max(0.61 * (delta / (delta + gamma)) * Rs * MJ_TO_MM - 0.12, 0.0)
 
+    # Turc (1961): radiation + temperature, with a dryness correction below
+    # 50% RH. 23.8846 converts Rs from MJ/m²/day to the cal/cm²/day the
+    # original formula uses.
+    turc_k = 1.0 if RH_mean >= 50 else 1 + (50 - RH_mean) / 70
+    ET0_turc = max(0.013 * (T_mean / (T_mean + 15)) * (23.8846 * Rs + 50) * turc_k, 0.0)
+
     return {
         "computed_at":       int(time.time()),
         "window_start":      min(timestamps),
@@ -133,5 +141,6 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
             "hargreaves_samani": round(ET0_hs, 3),
             "priestley_taylor":  round(ET0_pt, 3),
             "makkink":           round(ET0_mk, 3),
+            "turc":              round(ET0_turc, 3),
         },
     }

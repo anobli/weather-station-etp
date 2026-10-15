@@ -362,6 +362,7 @@ async function refresh() {
       hargreaves_samani: 'Hargreaves-Samani',
       priestley_taylor:  'Priestley-Taylor',
       makkink:           'Makkink',
+      turc:              'Turc',
     };
     const rows = [['Penman-Monteith (reference)', etp.et0_mm_per_day, 0]];
     for (const [key, val] of Object.entries(etp.et0_alt_mm_per_day || {})) {
