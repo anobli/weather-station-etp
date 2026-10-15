@@ -245,6 +245,78 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
     }
 
 
+def _parse_date_range(start: date, end: date) -> tuple[int, int]:
+    if end < start:
+        raise HTTPException(status_code=400, detail="end date must be on or after start date")
+    start_ts, _ = export.local_day_bounds(start, TZ)
+    _, end_ts = export.local_day_bounds(end, TZ)
+    return start_ts, end_ts
+
+
+MAX_BROWSE_ROWS = 2000
+
+
+@app.get("/api/observations/range")
+def observations_range(start: date, end: date, station: str | None = None):
+    """Raw observations in a date range, for the dashboard's data browser.
+    Capped at MAX_BROWSE_ROWS (most recent within the range); use
+    /api/export/range for the complete CSV."""
+    start_ts, end_ts = _parse_date_range(start, end)
+    rows = _station(station).db.get_range(start_ts, end_ts)
+    total = len(rows)
+    rows = rows[-MAX_BROWSE_ROWS:]
+    return {
+        "total": total,
+        "rows": [
+            {
+                "timestamp":           _iso(r["timestamp"]),
+                "temperature_c":       r["temperature"],
+                "humidity_pct":        r["humidity"],
+                "wind_speed_ms":       r["wind_speed"],
+                "solar_radiation_wm2": r["solar_radiation"],
+                "pressure_hpa":        r["pressure"],
+            }
+            for r in rows
+        ],
+    }
+
+
+@app.get("/api/observations/archive")
+def observations_archive(start: date, end: date, station: str | None = None):
+    """Archived hourly min/max/mean buckets in a date range, for the dashboard's
+    data browser. Capped at MAX_BROWSE_ROWS; use /api/export/archive for the
+    complete CSV."""
+    start_ts, end_ts = _parse_date_range(start, end)
+    rows = _station(station).db.get_archive_range(start_ts, end_ts)
+    total = len(rows)
+    rows = rows[-MAX_BROWSE_ROWS:]
+    return {
+        "total": total,
+        "rows": [
+            {
+                "hour_start":          _iso(r["hour_start"]),
+                "temperature_min_c":   r["temperature_min"],
+                "temperature_max_c":   r["temperature_max"],
+                "temperature_mean_c":  r["temperature_mean"],
+                "humidity_min_pct":    r["humidity_min"],
+                "humidity_max_pct":    r["humidity_max"],
+                "humidity_mean_pct":   r["humidity_mean"],
+                "wind_speed_min_ms":   r["wind_speed_min"],
+                "wind_speed_max_ms":   r["wind_speed_max"],
+                "wind_speed_mean_ms":  r["wind_speed_mean"],
+                "solar_radiation_min_wm2":  r["solar_radiation_min"],
+                "solar_radiation_max_wm2":  r["solar_radiation_max"],
+                "solar_radiation_mean_wm2": r["solar_radiation_mean"],
+                "pressure_min_hpa":    r["pressure_min"],
+                "pressure_max_hpa":    r["pressure_max"],
+                "pressure_mean_hpa":   r["pressure_mean"],
+                "sample_count":        r["sample_count"],
+            }
+            for r in rows
+        ],
+    }
+
+
 @app.get("/api/observations/latest")
 def latest_obs(station: str | None = None):
     obs = _station(station).db.get_latest_observation()
@@ -282,10 +354,7 @@ def export_daily(station: str | None = None):
 def export_range(start: date, end: date, station: str | None = None):
     """CSV of observations between two local calendar dates (inclusive)."""
     st = _station(station)
-    if end < start:
-        raise HTTPException(status_code=400, detail="end date must be on or after start date")
-    start_ts, _ = export.local_day_bounds(start, TZ)
-    _, end_ts = export.local_day_bounds(end, TZ)
+    start_ts, end_ts = _parse_date_range(start, end)
     rows = st.db.get_range(start_ts, end_ts)
     return _csv_response(rows, f"weather-station-{st.name}-{start.isoformat()}_to_{end.isoformat()}.csv")
 
@@ -295,10 +364,7 @@ def export_archive(start: date, end: date, station: str | None = None):
     """CSV of archived hourly min/max/mean buckets (beyond OBSERVATION_RETENTION_HOURS,
     raw per-minute data is downsampled into these rather than deleted)."""
     st = _station(station)
-    if end < start:
-        raise HTTPException(status_code=400, detail="end date must be on or after start date")
-    start_ts, _ = export.local_day_bounds(start, TZ)
-    _, end_ts = export.local_day_bounds(end, TZ)
+    start_ts, end_ts = _parse_date_range(start, end)
     rows = st.db.get_archive_range(start_ts, end_ts)
     return _csv_response(
         rows, f"weather-station-{st.name}-archive-{start.isoformat()}_to_{end.isoformat()}.csv",
@@ -346,6 +412,7 @@ _HTML = """<!DOCTYPE html>
   <nav class="tabs" id="view-tabs">
     <button class="tab active" data-view="overview">Overview</button>
     <button class="tab" data-view="chart">Daily ETP Chart</button>
+    <button class="tab" data-view="browse">Browse Data</button>
   </nav>
 
   <div id="view-overview">
@@ -429,6 +496,33 @@ _HTML = """<!DOCTYPE html>
   </div>
   </div>
 
+  <div id="view-browse" hidden>
+  <h2>Browse Collected Data</h2>
+  <div class="card" style="margin-bottom:2rem">
+    <form id="browse-range" style="display:flex;gap:.75rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:1rem">
+      <div class="tabs" id="browse-mode" style="margin:0">
+        <button type="button" class="tab active" data-mode="raw">Raw observations</button>
+        <button type="button" class="tab" data-mode="archive">Archived hourly</button>
+      </div>
+      <label style="font-size:.75rem;color:#94a3b8">From<br>
+        <input type="date" name="start" required style="margin-top:.3rem">
+      </label>
+      <label style="font-size:.75rem;color:#94a3b8">To<br>
+        <input type="date" name="end" required style="margin-top:.3rem">
+      </label>
+      <button type="submit" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#7dd3fc;color:#0f172a;font-weight:600;cursor:pointer">Load</button>
+      <a id="browse-csv" href="#" style="padding:.45rem 1rem;border-radius:.4rem;background:#334155;color:#e2e8f0;text-decoration:none">Download CSV for this range</a>
+    </form>
+    <div id="browse-note" class="sub" style="margin-bottom:.5rem"></div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead id="browse-thead"></thead>
+        <tbody id="browse-tbody"><tr><td style="color:#64748b">Pick a date range and click Load.</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+  </div>
+
 <script>
 const fmt = v => v != null ? v : '—';
 const fmtDt = iso => iso ? new Date(iso).toLocaleString() : '—';
@@ -451,6 +545,8 @@ const methodColor = {
 let lastDailyDays = [];
 let dailyStart = '';
 let dailyEnd = '';
+let browseMode = 'raw';
+let browseLoadedOnce = false;
 let station = null;
 const q = (path, extra = '') => `${path}?station=${encodeURIComponent(station)}${extra}`;
 
@@ -476,7 +572,16 @@ document.getElementById('view-tabs').onclick = e => {
   document.querySelectorAll('#view-tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
   document.getElementById('view-overview').hidden = view !== 'overview';
   document.getElementById('view-chart').hidden = view !== 'chart';
+  document.getElementById('view-browse').hidden = view !== 'browse';
   if (view === 'chart') drawDailyChart(lastDailyDays);
+  if (view === 'browse' && !browseLoadedOnce) {
+    browseLoadedOnce = true;
+    const end = new Date();
+    const start = new Date(end.getTime() - 2 * 86400_000);  // last 2 days of raw data by default
+    document.querySelector('#browse-range [name=start]').value = start.toISOString().slice(0, 10);
+    document.querySelector('#browse-range [name=end]').value = end.toISOString().slice(0, 10);
+    loadBrowse();
+  }
 };
 
 document.getElementById('daily-range').onsubmit = e => {
@@ -503,6 +608,90 @@ async function loadDaily() {
   drawDailyChart(lastDailyDays);
 }
 
+const fmtNum = decimals => v => v != null ? v.toFixed(decimals) : '—';
+const BROWSE_COLUMNS = {
+  raw: [
+    ['Timestamp', 'timestamp', fmtDt],
+    ['Temp °C', 'temperature_c', fmtNum(1)],
+    ['Humidity %', 'humidity_pct', fmtNum(0)],
+    ['Wind m/s', 'wind_speed_ms', fmtNum(1)],
+    ['Solar W/m²', 'solar_radiation_wm2', fmtNum(0)],
+    ['Pressure hPa', 'pressure_hpa', fmtNum(1)],
+  ],
+  archive: [
+    ['Hour', 'hour_start', fmtDt],
+    ['Temp min', 'temperature_min_c', fmtNum(1)],
+    ['Temp max', 'temperature_max_c', fmtNum(1)],
+    ['Temp mean', 'temperature_mean_c', fmtNum(1)],
+    ['RH min', 'humidity_min_pct', fmtNum(0)],
+    ['RH max', 'humidity_max_pct', fmtNum(0)],
+    ['RH mean', 'humidity_mean_pct', fmtNum(0)],
+    ['Wind min', 'wind_speed_min_ms', fmtNum(1)],
+    ['Wind max', 'wind_speed_max_ms', fmtNum(1)],
+    ['Wind mean', 'wind_speed_mean_ms', fmtNum(1)],
+    ['Solar min', 'solar_radiation_min_wm2', fmtNum(0)],
+    ['Solar max', 'solar_radiation_max_wm2', fmtNum(0)],
+    ['Solar mean', 'solar_radiation_mean_wm2', fmtNum(0)],
+    ['Pressure min', 'pressure_min_hpa', fmtNum(1)],
+    ['Pressure max', 'pressure_max_hpa', fmtNum(1)],
+    ['Pressure mean', 'pressure_mean_hpa', fmtNum(1)],
+    ['Samples', 'sample_count', v => fmt(v)],
+  ],
+};
+
+document.getElementById('browse-mode').onclick = e => {
+  const mode = e.target.dataset.mode;
+  if (!mode || mode === browseMode) return;
+  browseMode = mode;
+  document.querySelectorAll('#browse-mode .tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
+  loadBrowse();
+};
+
+document.getElementById('browse-range').onsubmit = e => {
+  e.preventDefault();
+  loadBrowse();
+};
+
+async function loadBrowse() {
+  if (!station) return;
+  const form = document.getElementById('browse-range');
+  const start = form.elements.start.value;
+  const end = form.elements.end.value;
+  const note = document.getElementById('browse-note');
+  const cols = BROWSE_COLUMNS[browseMode];
+
+  const endpoint = browseMode === 'archive' ? '/api/observations/archive' : '/api/observations/range';
+  const exportEndpoint = browseMode === 'archive' ? '/api/export/archive' : '/api/export/range';
+  document.getElementById('browse-csv').href =
+    `${exportEndpoint}?station=${encodeURIComponent(station)}&start=${start}&end=${end}`;
+
+  document.getElementById('browse-thead').innerHTML = `<tr>${cols.map(([label]) => `<th>${label}</th>`).join('')}</tr>`;
+  const tbody = document.getElementById('browse-tbody');
+
+  if (!start || !end) {
+    note.textContent = '';
+    tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:#64748b">Pick a date range and click Load.</td></tr>`;
+    return;
+  }
+
+  tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:#64748b">loading…</td></tr>`;
+  const data = await fetch(`${endpoint}?station=${encodeURIComponent(station)}&start=${start}&end=${end}`)
+    .then(r => r.ok ? r.json() : null).catch(() => null);
+
+  if (!data || data.rows.length === 0) {
+    tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:#64748b">No data in this range</td></tr>`;
+    note.textContent = '';
+    return;
+  }
+
+  tbody.innerHTML = data.rows.map(row =>
+    `<tr>${cols.map(([, key, format]) => `<td>${format(row[key])}</td>`).join('')}</tr>`
+  ).join('');
+  note.textContent = data.total > data.rows.length
+    ? `Showing the most recent ${data.rows.length} of ${data.total} rows — narrow the date range or download the CSV for everything.`
+    : `${data.total} row(s)`;
+}
+
 function selectStation() {
   document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.st === station));
   document.getElementById('export-daily').href = q('/api/export/daily');
@@ -514,6 +703,7 @@ function selectStation() {
   document.getElementById('last-seen').textContent = '';
   document.getElementById('methods').innerHTML = '<tr><td colspan="3" style="color:#64748b">loading…</td></tr>';
   loadDaily();
+  if (browseLoadedOnce) loadBrowse();
   refresh();
 }
 
