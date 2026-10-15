@@ -39,6 +39,10 @@ services:
       # Trial signups issue a single "API key" shaped CLIENTID_SECRET -> put
       # it whole in PWSWEATHER_API_KEY. If you have a separate client_id and
       # client_secret instead, set PWSWEATHER_CLIENT_ID/_CLIENT_SECRET.
+      # PWSWEATHER_STATION_ID is only used for the bare "pwsweather" form of
+      # STATION_TYPE above; with "pwsweather:ID" (incl. multiple instances),
+      # the id in STATION_TYPE wins and this is ignored. Credentials below
+      # are shared across all pwsweather instances (same Xweather account).
       PWSWEATHER_STATION_ID: ${PWSWEATHER_STATION_ID:-}
       PWSWEATHER_API_KEY: ${PWSWEATHER_API_KEY:-}
       PWSWEATHER_POLL_SECONDS: ${PWSWEATHER_POLL_SECONDS:-300}
