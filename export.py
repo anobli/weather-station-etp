@@ -13,6 +13,29 @@ COLUMNS = [
     ("pressure_hpa",        lambda r, tz: r["pressure"]),
 ]
 
+# Downsampled hourly buckets (observations_hourly), used once raw
+# observations age past OBSERVATION_RETENTION_HOURS and get archived.
+ARCHIVE_COLUMNS = [
+    ("hour_start_utc",   lambda r, tz: datetime.fromtimestamp(r["hour_start"], tz=timezone.utc).isoformat()),
+    ("hour_start_local", lambda r, tz: datetime.fromtimestamp(r["hour_start"], tz=tz).isoformat()),
+    ("temperature_min_c",       lambda r, tz: r["temperature_min"]),
+    ("temperature_max_c",       lambda r, tz: r["temperature_max"]),
+    ("temperature_mean_c",      lambda r, tz: r["temperature_mean"]),
+    ("humidity_min_pct",        lambda r, tz: r["humidity_min"]),
+    ("humidity_max_pct",        lambda r, tz: r["humidity_max"]),
+    ("humidity_mean_pct",       lambda r, tz: r["humidity_mean"]),
+    ("wind_speed_min_ms",       lambda r, tz: r["wind_speed_min"]),
+    ("wind_speed_max_ms",       lambda r, tz: r["wind_speed_max"]),
+    ("wind_speed_mean_ms",      lambda r, tz: r["wind_speed_mean"]),
+    ("solar_radiation_min_wm2", lambda r, tz: r["solar_radiation_min"]),
+    ("solar_radiation_max_wm2", lambda r, tz: r["solar_radiation_max"]),
+    ("solar_radiation_mean_wm2", lambda r, tz: r["solar_radiation_mean"]),
+    ("pressure_min_hpa",        lambda r, tz: r["pressure_min"]),
+    ("pressure_max_hpa",        lambda r, tz: r["pressure_max"]),
+    ("pressure_mean_hpa",       lambda r, tz: r["pressure_mean"]),
+    ("sample_count",            lambda r, tz: r["sample_count"]),
+]
+
 
 def local_day_bounds(day: date, tz: ZoneInfo) -> tuple[int, int]:
     """Return (start_ts, end_ts) epoch seconds spanning local midnight `day` to midnight `day + 1`."""
@@ -21,10 +44,10 @@ def local_day_bounds(day: date, tz: ZoneInfo) -> tuple[int, int]:
     return int(start.timestamp()), int(end.timestamp())
 
 
-def rows_to_csv(rows: list[dict], tz: ZoneInfo) -> str:
+def rows_to_csv(rows: list[dict], tz: ZoneInfo, columns=COLUMNS) -> str:
     buf = io.StringIO()
     writer = csv.writer(buf)
-    writer.writerow([name for name, _ in COLUMNS])
+    writer.writerow([name for name, _ in columns])
     for r in rows:
-        writer.writerow([fn(r, tz) for _, fn in COLUMNS])
+        writer.writerow([fn(r, tz) for _, fn in columns])
     return buf.getvalue()

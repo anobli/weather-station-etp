@@ -27,11 +27,14 @@ LATITUDE          = float(os.environ.get("LATITUDE", "48.8566"))
 ELEVATION         = float(os.environ.get("ELEVATION", "100"))
 ANEMOMETER_HEIGHT = float(os.environ.get("ANEMOMETER_HEIGHT", "2.0"))
 DATA_DIR          = os.environ.get("DATA_DIR", "/data")
-# How long raw per-minute observations are kept before being purged. Default
-# 90 days (2160h) so new ET0 methods can be recomputed over real history
-# instead of only starting from whenever they were added — SQLite storage
-# cost for this is trivial (a few MB/station over that window).
-OBSERVATION_RETENTION_HOURS = int(os.environ.get("OBSERVATION_RETENTION_HOURS", "2160"))
+# How long raw per-minute observations are kept at full resolution before
+# being downsampled into hourly min/max/mean buckets (kept indefinitely —
+# see Database.archive_old_observations). Default 1 year, so any ET0 method
+# can be recomputed at full precision over real history instead of only
+# starting from whenever it was added; beyond that, hourly buckets still
+# carry enough signal (min/max temp, mean RH/wind/solar) for every method
+# here, and for longer-term climate/irrigation trend analysis.
+OBSERVATION_RETENTION_HOURS = int(os.environ.get("OBSERVATION_RETENTION_HOURS", "8760"))
 # Comma-separated list, e.g. "tempest,ecowitt,pwsweather"; the first one is the API default.
 STATION_TYPES     = list(dict.fromkeys(
     s.strip().lower() for s in os.environ.get("STATION_TYPE", "tempest").split(",") if s.strip()
@@ -87,9 +90,11 @@ def run_etp():
             logger.exception("[%s] ETP computation failed", name)
 
 
-def run_cleanup():
-    for st in stations.values():
-        st.db.cleanup_old_observations(keep_hours=OBSERVATION_RETENTION_HOURS)
+def run_archive():
+    for name, st in stations.items():
+        written = st.db.archive_old_observations(keep_hours=OBSERVATION_RETENTION_HOURS)
+        if written:
+            logger.info("[%s] Archived %d hourly bucket(s) of raw observations", name, written)
 
 
 @asynccontextmanager
@@ -98,7 +103,7 @@ async def lifespan(app: FastAPI):
         st.db.init()
         st.start()
     sched.add_job(run_etp,     "cron", minute=0)       # top of every hour
-    sched.add_job(run_cleanup, "cron", hour=3, minute=0)  # daily purge
+    sched.add_job(run_archive, "cron", hour=3, minute=0)  # daily downsample + purge
     sched.start()
     run_etp()   # immediate first computation on startup
     yield
@@ -138,6 +143,7 @@ def health(station: str | None = None):
         "latitude": LATITUDE,
         "elevation_m": ELEVATION,
         "anemometer_height_m": ANEMOMETER_HEIGHT,
+        "observation_retention_days": round(OBSERVATION_RETENTION_HOURS / 24, 1),
     }
 
 
@@ -223,9 +229,9 @@ def latest_obs(station: str | None = None):
     }
 
 
-def _csv_response(rows: list[dict], filename: str) -> Response:
+def _csv_response(rows: list[dict], filename: str, columns=export.COLUMNS) -> Response:
     return Response(
-        content=export.rows_to_csv(rows, TZ),
+        content=export.rows_to_csv(rows, TZ, columns),
         media_type="text/csv",
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
@@ -251,6 +257,22 @@ def export_range(start: date, end: date, station: str | None = None):
     _, end_ts = export.local_day_bounds(end, TZ)
     rows = st.db.get_range(start_ts, end_ts)
     return _csv_response(rows, f"weather-station-{st.name}-{start.isoformat()}_to_{end.isoformat()}.csv")
+
+
+@app.get("/api/export/archive")
+def export_archive(start: date, end: date, station: str | None = None):
+    """CSV of archived hourly min/max/mean buckets (beyond OBSERVATION_RETENTION_HOURS,
+    raw per-minute data is downsampled into these rather than deleted)."""
+    st = _station(station)
+    if end < start:
+        raise HTTPException(status_code=400, detail="end date must be on or after start date")
+    start_ts, _ = export.local_day_bounds(start, TZ)
+    _, end_ts = export.local_day_bounds(end, TZ)
+    rows = st.db.get_archive_range(start_ts, end_ts)
+    return _csv_response(
+        rows, f"weather-station-{st.name}-archive-{start.isoformat()}_to_{end.isoformat()}.csv",
+        columns=export.ARCHIVE_COLUMNS,
+    )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -350,8 +372,10 @@ _HTML = """<!DOCTYPE html>
         <input type="date" name="end" required style="margin-top:.3rem">
       </label>
       <input type="hidden" name="station" id="export-station">
-      <button type="submit" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#7dd3fc;color:#0f172a;font-weight:600;cursor:pointer">Download CSV</button>
+      <button type="submit" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#7dd3fc;color:#0f172a;font-weight:600;cursor:pointer">Download raw CSV</button>
+      <button type="submit" formaction="/api/export/archive" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#334155;color:#e2e8f0;cursor:pointer">Download archived hourly CSV</button>
     </form>
+    <div class="sub" style="margin-top:.5rem">Raw covers the last ~<span id="retention-days">?</span> days; archive holds downsampled hourly min/max/mean for everything older.</div>
   </div>
   </div>
 
@@ -508,6 +532,9 @@ async function refresh() {
   if (health.last_observation_at) {
     document.getElementById('last-seen').textContent =
       `Last: ${fmtDt(health.last_observation_at)}`;
+  }
+  if (health.observation_retention_days != null) {
+    document.getElementById('retention-days').textContent = health.observation_retention_days;
   }
 
   const tbody = document.getElementById('hist');

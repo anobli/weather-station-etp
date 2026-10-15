@@ -19,9 +19,10 @@ services:
       HTTP_PORT: ${HTTP_PORT:-8080}
       # IANA timezone for CSV export day boundaries, e.g. Europe/Paris
       TIMEZONE: ${TIMEZONE:-Europe/Paris}
-      # Raw observation retention (hours) before purge; default 90 days so
-      # future ET0 methods can be recomputed over real history
-      OBSERVATION_RETENTION_HOURS: ${OBSERVATION_RETENTION_HOURS:-2160}
+      # Raw per-minute observation retention (hours) before being downsampled
+      # into hourly min/max/mean buckets (kept forever); default 1 year so any
+      # future ET0 method can be recomputed at full precision over real history
+      OBSERVATION_RETENTION_HOURS: ${OBSERVATION_RETENTION_HOURS:-8760}
       # Weather station driver(s) (see stations/__init__.py): tempest | ecowitt | pwsweather
       # Comma-separate to run several at once (one DB + ETP each), e.g. tempest,ecowitt
       STATION_TYPE: ${STATION_TYPE:-tempest}

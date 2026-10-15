@@ -34,6 +34,16 @@ class Database:
                 );
                 CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(timestamp);
 
+                CREATE TABLE IF NOT EXISTS observations_hourly (
+                    hour_start INTEGER PRIMARY KEY,
+                    temperature_min REAL, temperature_max REAL, temperature_mean REAL,
+                    humidity_min REAL, humidity_max REAL, humidity_mean REAL,
+                    wind_speed_min REAL, wind_speed_max REAL, wind_speed_mean REAL,
+                    solar_radiation_min REAL, solar_radiation_max REAL, solar_radiation_mean REAL,
+                    pressure_min REAL, pressure_max REAL, pressure_mean REAL,
+                    sample_count INTEGER NOT NULL
+                );
+
                 CREATE TABLE IF NOT EXISTS etp_results (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     computed_at     INTEGER NOT NULL,
@@ -130,7 +140,41 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    def cleanup_old_observations(self, keep_hours: int = 49):
+    def get_archive_range(self, start_ts: int, end_ts: int) -> list[dict]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM observations_hourly WHERE hour_start >= ? AND hour_start < ? ORDER BY hour_start",
+                (start_ts, end_ts),
+            ).fetchall()
+        return [dict(r) for r in rows]
+
+    def archive_old_observations(self, keep_hours: int) -> int:
+        """Downsample raw observations older than `keep_hours` into hourly
+        min/max/mean buckets (observations_hourly, kept indefinitely — a
+        single row per hour is negligible storage), then delete the
+        now-redundant raw rows. Returns the number of hourly buckets written
+        or refreshed."""
         cutoff = int(time.time()) - keep_hours * 3600
         with self._conn() as c:
+            cur = c.execute(
+                """INSERT OR REPLACE INTO observations_hourly
+                   (hour_start, temperature_min, temperature_max, temperature_mean,
+                    humidity_min, humidity_max, humidity_mean,
+                    wind_speed_min, wind_speed_max, wind_speed_mean,
+                    solar_radiation_min, solar_radiation_max, solar_radiation_mean,
+                    pressure_min, pressure_max, pressure_mean, sample_count)
+                   SELECT (timestamp / 3600) * 3600,
+                          MIN(temperature), MAX(temperature), AVG(temperature),
+                          MIN(humidity), MAX(humidity), AVG(humidity),
+                          MIN(wind_speed), MAX(wind_speed), AVG(wind_speed),
+                          MIN(solar_radiation), MAX(solar_radiation), AVG(solar_radiation),
+                          MIN(pressure), MAX(pressure), AVG(pressure),
+                          COUNT(*)
+                   FROM observations
+                   WHERE timestamp < ?
+                   GROUP BY (timestamp / 3600) * 3600""",
+                (cutoff,),
+            )
+            written = cur.rowcount
             c.execute("DELETE FROM observations WHERE timestamp < ?", (cutoff,))
+        return written
