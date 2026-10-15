@@ -24,7 +24,11 @@ services:
       # future ET0 method can be recomputed at full precision over real history
       OBSERVATION_RETENTION_HOURS: ${OBSERVATION_RETENTION_HOURS:-8760}
       # Weather station driver(s) (see stations/__init__.py): tempest | ecowitt | pwsweather
-      # Comma-separate to run several at once (one DB + ETP each), e.g. tempest,ecowitt
+      # Comma-separate "type" or "type:instance" entries to run several at
+      # once (one DB + ETP each), e.g. tempest,ecowitt or
+      # pwsweather:STATION1,pwsweather:STATION2 for two same-vendor stations
+      # (currently only PWSWeather supports two live instances at once -
+      # Tempest/Ecowitt still need listener-sharing work for that)
       STATION_TYPE: ${STATION_TYPE:-tempest}
       # Ecowitt only: port the gateway's "Customized" upload (Ecowitt protocol)
       # posts to, and optional PASSKEY filter (logged on first upload)

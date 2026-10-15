@@ -35,10 +35,39 @@ DATA_DIR          = os.environ.get("DATA_DIR", "/data")
 # carry enough signal (min/max temp, mean RH/wind/solar) for every method
 # here, and for longer-term climate/irrigation trend analysis.
 OBSERVATION_RETENTION_HOURS = int(os.environ.get("OBSERVATION_RETENTION_HOURS", "8760"))
-# Comma-separated list, e.g. "tempest,ecowitt,pwsweather"; the first one is the API default.
-STATION_TYPES     = list(dict.fromkeys(
-    s.strip().lower() for s in os.environ.get("STATION_TYPE", "tempest").split(",") if s.strip()
-))
+# Comma-separated list of "type" or "type:instance" entries; the first one
+# is the API default. Bare "type" (e.g. "tempest") is a single, unnamed
+# instance - identical to earlier single-station deployments, same DB
+# filename, no migration needed. "type:instance" (e.g.
+# "pwsweather:HALOLVANTAGE,pwsweather:OTHERSTATION") lets several stations
+# of the same vendor coexist, each with its own DB/ETP history; `instance`
+# is passed to the driver for instance-specific identification where that's
+# already meaningful (e.g. PWSWeather's station id). Receiving two
+# concurrent Tempest or Ecowitt instances still needs listener-sharing work
+# the drivers don't have yet (both would try to bind the same local
+# UDP/HTTP port) - this only wires up the addressing/DB side so it never
+# needs another migration once that lands.
+def _parse_station_entries(raw: str) -> list[tuple[str, str, str | None]]:
+    """Return (instance_key, station_type, instance_id) tuples, de-duplicated by instance_key."""
+    entries, seen = [], set()
+    for item in raw.split(","):
+        item = item.strip()
+        if not item:
+            continue
+        # Only the type is case-normalised - the instance id (e.g. a PWS
+        # station id) must keep its original case for drivers that send it
+        # on to a case-sensitive API.
+        station_type, _, instance_id = item.partition(":")
+        station_type = station_type.lower()
+        instance_id = instance_id or None
+        instance_key = station_type if instance_id is None else f"{station_type}-{instance_id.lower()}"
+        if instance_key in seen:
+            continue
+        seen.add(instance_key)
+        entries.append((instance_key, station_type, instance_id))
+    return entries
+
+STATION_ENTRIES = _parse_station_entries(os.environ.get("STATION_TYPE", "tempest"))
 
 try:
     TZ = ZoneInfo(os.environ.get("TIMEZONE", "Europe/Paris"))
@@ -48,27 +77,29 @@ except ZoneInfoNotFoundError:
 
 
 
-def _db_path(station_type: str) -> str:
-    return f"{DATA_DIR}/observations-{station_type}.db"
+def _db_path(instance_key: str) -> str:
+    return f"{DATA_DIR}/observations-{instance_key}.db"
 
 
 # Pre-multi-station deployments used a single observations.db: hand it to the
 # first configured station so its ETP history is kept.
 _legacy_db = f"{DATA_DIR}/observations.db"
-if os.path.exists(_legacy_db) and not os.path.exists(_db_path(STATION_TYPES[0])):
-    logger.info("Migrating %s to %s", _legacy_db, _db_path(STATION_TYPES[0]))
-    os.rename(_legacy_db, _db_path(STATION_TYPES[0]))
+_first_key = STATION_ENTRIES[0][0]
+if os.path.exists(_legacy_db) and not os.path.exists(_db_path(_first_key)):
+    logger.info("Migrating %s to %s", _legacy_db, _db_path(_first_key))
+    os.rename(_legacy_db, _db_path(_first_key))
 
-# One database (observations + ETP) per station.
+# One database (observations + ETP) per station instance.
 stations: dict[str, WeatherStationListener] = {
-    t: create_listener(t, Database(_db_path(t))) for t in STATION_TYPES
+    instance_key: create_listener(station_type, Database(_db_path(instance_key)), instance_id=instance_id)
+    for instance_key, station_type, instance_id in STATION_ENTRIES
 }
 sched = BackgroundScheduler()
 
 
 def _station(name: str | None) -> WeatherStationListener:
     if name is None:
-        return stations[STATION_TYPES[0]]
+        return stations[_first_key]
     try:
         return stations[name.lower()]
     except KeyError:

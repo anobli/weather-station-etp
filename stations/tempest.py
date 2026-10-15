@@ -11,12 +11,21 @@ TEMPEST_UDP_PORT = 50222
 
 
 class TempestListener(WeatherStationListener):
-    """WeatherFlow Tempest, via the hub's local UDP broadcast API."""
+    """WeatherFlow Tempest, via the hub's local UDP broadcast API.
+
+    `instance_id`, if set, is matched against the broadcast's `hub_sn` to
+    pick out one hub among several on the same network. Running two
+    instances of this driver in the same process is NOT yet safe even with
+    different `instance_id`s: both would bind the same UDP port, and the
+    kernel delivers each broadcast datagram to only one of them rather than
+    both - a shared single socket demultiplexing to several DBs is needed
+    for that and doesn't exist yet.
+    """
 
     name = "tempest"
 
-    def __init__(self, db, port: int = TEMPEST_UDP_PORT):
-        super().__init__(db)
+    def __init__(self, db, port: int = TEMPEST_UDP_PORT, instance_id: str | None = None):
+        super().__init__(db, instance_id=instance_id)
         self.port = port
 
     def _run(self):
@@ -45,6 +54,8 @@ class TempestListener(WeatherStationListener):
     def _handle(self, msg: dict):
         # obs_st: full observation from the Tempest sensor (~1 min interval)
         if msg.get("type") != "obs_st":
+            return
+        if self.instance_id and (msg.get("hub_sn") or "").lower() != self.instance_id.lower():
             return
 
         for obs in msg.get("obs", []):

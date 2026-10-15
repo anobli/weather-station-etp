@@ -30,14 +30,23 @@ class PWSWeatherListener(WeatherStationListener):
     Unlike Tempest/Ecowitt, a PWSWeather station isn't reachable on the local
     network: readings are pulled from Xweather's cloud API on a timer rather
     than received as they arrive, so freshness is bounded by `poll_seconds`.
+    Unlike those drivers, several instances of this one can run
+    concurrently (it only ever makes outbound HTTP calls, so there's no
+    shared port to conflict over): `instance_id` (e.g. from
+    "pwsweather:HALOLVANTAGE") is used directly as the station id, taking
+    priority over PWSWEATHER_STATION_ID, letting several PWSWeather
+    stations be configured without separate env vars per instance - they'd
+    typically still share one PWSWEATHER_API_KEY/_CLIENT_ID/_SECRET (same
+    Xweather account).
     """
 
     name = "pwsweather"
 
     def __init__(self, db, station_id: str | None = None, client_id: str | None = None,
-                 client_secret: str | None = None, poll_seconds: int | None = None):
-        super().__init__(db)
-        station_id = station_id or os.environ.get("PWSWEATHER_STATION_ID")
+                 client_secret: str | None = None, poll_seconds: int | None = None,
+                 instance_id: str | None = None):
+        super().__init__(db, instance_id=instance_id)
+        station_id = instance_id or station_id or os.environ.get("PWSWEATHER_STATION_ID")
         # Xweather expects PWSWeather station ids prefixed with "PWS_"
         # (e.g. PWS_KAZMTPHX); add it if the configured id doesn't have it.
         self.station_id = (

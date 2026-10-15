@@ -30,8 +30,12 @@ class WeatherStationListener(ABC):
     # disconnected; override for drivers that poll on a longer interval.
     stale_after: float = 120
 
-    def __init__(self, db):
+    def __init__(self, db, instance_id: str | None = None):
         self.db = db
+        # Vendor-specific identifier distinguishing this instance from other
+        # stations of the same type (e.g. a hub serial number, gateway
+        # PASSKEY, or station id); None for a single, unnamed instance.
+        self.instance_id = instance_id
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_seen: float | None = None
@@ -39,7 +43,7 @@ class WeatherStationListener(ABC):
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"{self.name}-listener")
         self._thread.start()
-        logger.info("%s listener started", self.name)
+        logger.info("%s listener started%s", self.name, f" (instance={self.instance_id})" if self.instance_id else "")
 
     def stop(self):
         self._stop.set()

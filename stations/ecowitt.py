@@ -45,16 +45,25 @@ class EcowittListener(WeatherStationListener):
     Configure in WS View Plus / gateway web UI → Weather Services → Customized:
     protocol Ecowitt, server = this host's IP, port = ECOWITT_PORT, any path,
     interval ≤ 60 s.
+
+    `instance_id`, if set, is the PASSKEY of the one gateway this instance
+    should keep (overrides ECOWITT_PASSKEY) - that already picks one gateway
+    out of several uploading to the same port. Running two instances of this
+    driver in the same process is NOT yet safe: both would try to bind the
+    same HTTP port, which fails for the second one. A single shared listener
+    demultiplexing by PASSKEY to several DBs is needed for that and doesn't
+    exist yet.
     """
 
     name = "ecowitt"
 
-    def __init__(self, db, port: int | None = None, passkey: str | None = None):
-        super().__init__(db)
+    def __init__(self, db, port: int | None = None, passkey: str | None = None,
+                 instance_id: str | None = None):
+        super().__init__(db, instance_id=instance_id)
         self.port = port or int(os.environ.get("ECOWITT_PORT", ECOWITT_HTTP_PORT))
         # Optional: only accept uploads from the gateway with this PASSKEY
         # (MD5 of its MAC, visible in the first upload logged below).
-        self.passkey = (passkey or os.environ.get("ECOWITT_PASSKEY") or "").upper() or None
+        self.passkey = (instance_id or passkey or os.environ.get("ECOWITT_PASSKEY") or "").upper() or None
         self._seen_gateways: set[str] = set()
 
     def _run(self):

@@ -11,14 +11,14 @@ DRIVERS: dict[str, type[WeatherStationListener]] = {
 }
 
 
-def create_listener(station_type: str, db) -> WeatherStationListener:
+def create_listener(station_type: str, db, instance_id: str | None = None) -> WeatherStationListener:
     try:
         cls = DRIVERS[station_type.lower()]
     except KeyError:
         raise ValueError(
             f"Unknown STATION_TYPE={station_type!r}; available: {', '.join(sorted(DRIVERS))}"
         ) from None
-    return cls(db)
+    return cls(db, instance_id=instance_id)
 
 
 __all__ = [
