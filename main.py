@@ -211,36 +211,44 @@ def etp_history(limit: int = 48, station: str | None = None):
 
 @app.get("/api/etp/daily")
 def etp_daily(station: str | None = None, start: date | None = None, end: date | None = None):
-    """One point per local calendar day, averaging that day's hourly rolling-24h
-    computations (etp_results is never purged, so this covers the station's
-    whole history, not just the last 49h of raw observations). `start`/`end`
-    (local calendar dates, inclusive) optionally restrict the range."""
+    """One point per local calendar day: the single rolling-24h computation whose
+    window spans that day end-to-end (local midnight to midnight) - the FAO-56 /
+    Meteo France convention of one ETo per calendar day from that day's actual
+    data. Averaging every hourly computation that happened to run during the day
+    instead mixes in trailing hours from the previous day and smears real
+    day-to-day swings into the number (etp_results is never purged, so this
+    covers the station's whole history, not just the last 49h of raw
+    observations). `start`/`end` (local calendar dates, inclusive) optionally
+    restrict the range."""
     if start and end and end < start:
         raise HTTPException(status_code=400, detail="end date must be on or after start date")
     start_ts = export.local_day_bounds(start, TZ)[0] if start else None
     end_ts = export.local_day_bounds(end, TZ)[1] if end else None
     rows = _station(station).db.get_etp_range(start_ts, end_ts)
 
-    days: dict[str, dict] = {}
+    # The hourly cron ticks on local-hour boundaries (UTC and local always
+    # differ by a whole number of hours), so there's normally an exact
+    # computation whose window_end lands on local midnight; allow half the
+    # hourly cadence of slack for a missed/delayed tick.
+    TOLERANCE_S = 1800
+    best: dict[date, tuple[int, dict]] = {}
     for r in rows:
-        day = datetime.fromtimestamp(r["computed_at"], tz=TZ).date().isoformat()
-        bucket = days.setdefault(day, {"et0_mm": [], "et0_alt_mm": {}})
-        bucket["et0_mm"].append(r["et0_mm"])
-        for method, value in r["et0_alt_mm"].items():
-            bucket["et0_alt_mm"].setdefault(method, []).append(value)
+        day = datetime.fromtimestamp(r["window_end"], tz=TZ).date() - timedelta(days=1)
+        target = export.local_day_bounds(day, TZ)[1]
+        dist = abs(r["window_end"] - target)
+        if day not in best or dist < best[day][0]:
+            best[day] = (dist, r)
 
     return {
         "days": [
             {
-                "date":    day,
-                "et0_mm":  round(sum(b["et0_mm"]) / len(b["et0_mm"]), 3),
-                "et0_alt_mm": {
-                    method: round(sum(values) / len(values), 3)
-                    for method, values in b["et0_alt_mm"].items()
-                },
-                "sample_count": len(b["et0_mm"]),
+                "date":              day.isoformat(),
+                "et0_mm":            r["et0_mm"],
+                "et0_alt_mm":        r["et0_alt_mm"],
+                "observation_count": r["observation_count"],
             }
-            for day, b in sorted(days.items())
+            for day, (dist, r) in sorted(best.items())
+            if dist <= TOLERANCE_S
         ]
     }
 
@@ -492,7 +500,7 @@ _HTML = """<!DOCTYPE html>
     </form>
     <canvas id="daily-chart" height="260" style="width:100%;max-width:100%"></canvas>
     <div id="daily-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
-    <div class="sub" style="margin-top:.5rem">Each point averages that day's hourly rolling-24h computations.</div>
+    <div class="sub" style="margin-top:.5rem">Each point is the single rolling-24h computation whose window spans that calendar day, local midnight to midnight.</div>
   </div>
   </div>
 
