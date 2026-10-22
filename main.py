@@ -109,7 +109,9 @@ def _station(name: str | None) -> WeatherStationListener:
 def run_etp():
     for name, st in stations.items():
         try:
-            result = compute_etp(st.db, LATITUDE, ELEVATION, ANEMOMETER_HEIGHT)
+            latitude = st.latitude if st.latitude is not None else LATITUDE
+            elevation = st.elevation if st.elevation is not None else ELEVATION
+            result = compute_etp(st.db, latitude, elevation, ANEMOMETER_HEIGHT)
             if result:
                 st.db.store_etp(result)
                 alt = ", ".join(f"{m}={v:.3f}" for m, v in result["et0_alt_mm"].items())
@@ -167,12 +169,14 @@ def list_stations():
 
 @app.get("/health")
 def health(station: str | None = None):
+    st = _station(station)
     return {
         "status": "ok",
         "commit": GIT_SHA,
-        **_station_status(_station(station)),
-        "latitude": LATITUDE,
-        "elevation_m": ELEVATION,
+        **_station_status(st),
+        "latitude": st.latitude if st.latitude is not None else LATITUDE,
+        "elevation_m": st.elevation if st.elevation is not None else ELEVATION,
+        "location_source": "station" if st.latitude is not None else "env",
         "anemometer_height_m": ANEMOMETER_HEIGHT,
         "observation_retention_days": round(OBSERVATION_RETENTION_HOURS / 24, 1),
     }
@@ -226,11 +230,12 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
     end_ts = export.local_day_bounds(end, TZ)[1] if end else None
     rows = _station(station).db.get_etp_range(start_ts, end_ts)
 
-    # The hourly cron ticks on local-hour boundaries (UTC and local always
-    # differ by a whole number of hours), so there's normally an exact
-    # computation whose window_end lands on local midnight; allow half the
-    # hourly cadence of slack for a missed/delayed tick.
-    TOLERANCE_S = 1800
+    # Pick whichever computation's window_end lands closest to local midnight
+    # for each calendar day - normally an exact hit, since the hourly cron
+    # ticks on local-hour boundaries (UTC and local always differ by a whole
+    # number of hours). No cutoff: a missed tick, a restart-triggered
+    # off-schedule run, or drift still gives the closest available estimate
+    # for that day rather than silently dropping it.
     best: dict[date, tuple[int, dict]] = {}
     for r in rows:
         day = datetime.fromtimestamp(r["window_end"], tz=TZ).date() - timedelta(days=1)
@@ -242,13 +247,13 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
     return {
         "days": [
             {
-                "date":              day.isoformat(),
-                "et0_mm":            r["et0_mm"],
-                "et0_alt_mm":        r["et0_alt_mm"],
-                "observation_count": r["observation_count"],
+                "date":                day.isoformat(),
+                "et0_mm":              r["et0_mm"],
+                "et0_alt_mm":          r["et0_alt_mm"],
+                "observation_count":   r["observation_count"],
+                "midnight_offset_min": round(dist / 60, 1),
             }
             for day, (dist, r) in sorted(best.items())
-            if dist <= TOLERANCE_S
         ]
     }
 
