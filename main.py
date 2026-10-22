@@ -207,6 +207,8 @@ def list_stations():
 @app.get("/health")
 def health(station: str | None = None):
     st = _station(station)
+    mf_lat = st.latitude if st.latitude is not None else st.default_latitude
+    mf_lon = st.longitude if st.longitude is not None else st.default_longitude
     return {
         "status": "ok",
         "commit": GIT_SHA,
@@ -216,6 +218,11 @@ def health(station: str | None = None):
         "location_source": "station" if st.latitude is not None else "env",
         "anemometer_height_m": ANEMOMETER_HEIGHT,
         "observation_retention_days": round(OBSERVATION_RETENTION_HOURS / 24, 1),
+        # Surfaced mainly for debugging: if longitude isn't learned from a
+        # station API (only PWSWeather does) and LONGITUDE isn't set, this
+        # silently falls back to the default below - easy to miss, so make
+        # the actual lat/lon used for the grid lookup visible here.
+        "meteofrance_source_latlon": [mf_lat, mf_lon],
         "meteofrance_grid_point": st.db.get_meteofrance_grid_point(),
     }
 
@@ -583,6 +590,22 @@ _HTML = """<!DOCTYPE html>
   </div>
   </div>
 
+  <div id="view-meteofrance" hidden>
+  <h2>Météo France ETPgrille — comparison</h2>
+  <div class="card" style="margin-bottom:1.5rem">
+    <div class="sub">
+      Daily ET0 interpolated onto a 0.125° grid, inverse-distance-squared from the 5 nearest
+      official stations - no altitude correction, so expect real divergence here in terrain with
+      strong local relief. Comparison only: never used to compute this station's own ETP.
+    </div>
+    <div style="margin-top:.75rem;font-size:.8rem;color:#94a3b8" id="mf-info">loading…</div>
+  </div>
+  <div class="card">
+    <canvas id="mf-chart" height="260" style="width:100%;max-width:100%"></canvas>
+    <div id="mf-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
+  </div>
+  </div>
+
 <script>
 const fmt = v => v != null ? v : '—';
 const fmtDt = iso => iso ? new Date(iso).toLocaleString() : '—';
@@ -615,17 +638,56 @@ const q = (path, extra = '') => `${path}?station=${encodeURIComponent(station)}$
 async function loadStations() {
   const { stations = [] } = await fetch('/api/stations').then(r => r.json()).catch(() => ({}));
   const names = stations.map(s => s.station_type);
+  const startOnMeteoFrance = location.hash.slice(1) === 'meteofrance';
   station = names.includes(location.hash.slice(1)) ? location.hash.slice(1) : names[0];
   const tabs = document.getElementById('tabs');
-  tabs.hidden = names.length < 2;
-  tabs.innerHTML = names.map(n => `<button class="tab" data-st="${n}">${n}</button>`).join('');
+  tabs.hidden = false;  // always >= 1 real station + the Météo France tab
+  tabs.innerHTML =
+    names.map(n => `<button class="tab" data-st="${n}">${n}</button>`).join('') +
+    `<button class="tab" data-mf="1">Météo France</button>`;
   tabs.onclick = e => {
+    if (e.target.dataset.mf) { location.hash = 'meteofrance'; showMeteoFranceView(); return; }
     if (!e.target.dataset.st) return;
     station = e.target.dataset.st;
     location.hash = station;
+    showStationView();
     selectStation();
   };
-  selectStation();
+  if (startOnMeteoFrance) { showMeteoFranceView(); } else { selectStation(); }
+}
+
+function showStationView() {
+  document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.st === station));
+  document.getElementById('view-tabs').hidden = false;
+  document.getElementById('view-meteofrance').hidden = true;
+  const active = document.querySelector('#view-tabs .tab.active')?.dataset.view || 'overview';
+  document.getElementById('view-overview').hidden = active !== 'overview';
+  document.getElementById('view-chart').hidden = active !== 'chart';
+  document.getElementById('view-browse').hidden = active !== 'browse';
+}
+
+async function showMeteoFranceView() {
+  document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', !!t.dataset.mf));
+  document.getElementById('view-tabs').hidden = true;
+  document.getElementById('view-overview').hidden = true;
+  document.getElementById('view-chart').hidden = true;
+  document.getElementById('view-browse').hidden = true;
+  document.getElementById('view-meteofrance').hidden = false;
+
+  const health = await fetch(q('/health')).then(r => r.json()).catch(() => ({}));
+  const info = document.getElementById('mf-info');
+  const [slat, slon] = health.meteofrance_source_latlon || [];
+  const grid = health.meteofrance_grid_point;
+  if (slat == null || !grid) {
+    info.textContent = 'No grid data yet - the daily refresh job may not have run yet (runs once on startup, otherwise 10:00 UTC).';
+  } else {
+    const [glon, glat] = grid;
+    const kmPerDeg = 111;
+    const distKm = Math.hypot((glat - slat) * kmPerDeg, (glon - slon) * kmPerDeg * Math.cos(slat * Math.PI / 180));
+    info.innerHTML = `Station "${station}" at (${slat.toFixed(4)}, ${slon.toFixed(4)}) → nearest grid point ` +
+      `(${glat.toFixed(3)}, ${glon.toFixed(3)}), ~${distKm.toFixed(1)} km away.`;
+  }
+  await loadDaily();
 }
 
 document.getElementById('view-tabs').onclick = e => {
@@ -668,6 +730,7 @@ async function loadDaily() {
   const daily = await fetch(q('/api/etp/daily', extra)).then(r => r.ok ? r.json() : null).catch(() => null);
   lastDailyDays = daily?.days || [];
   drawDailyChart(lastDailyDays);
+  if (!document.getElementById('view-meteofrance').hidden) drawMeteoFranceChart(lastDailyDays);
 }
 
 const fmtNum = decimals => v => v != null ? v.toFixed(decimals) : '—';
@@ -832,9 +895,9 @@ async function refresh() {
       ).join('');
 }
 
-function drawDailyChart(days) {
-  const canvas = document.getElementById('daily-chart');
-  const legendEl = document.getElementById('daily-legend');
+function drawChart(canvasId, legendId, days, methods) {
+  const canvas = document.getElementById(canvasId);
+  const legendEl = document.getElementById(legendId);
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   const W = canvas.clientWidth || 600;
@@ -862,6 +925,11 @@ function drawDailyChart(days) {
       (series.meteofrance ??= Array(days.length).fill(null))[i] = d.meteofrance_etp_mm;
     }
   });
+  if (methods) {
+    for (const key of Object.keys(series)) {
+      if (!methods.includes(key)) delete series[key];
+    }
+  }
 
   const allValues = Object.values(series).flat().filter(v => v != null);
   const yMax = Math.max(...allValues, 0.1) * 1.1;
@@ -907,7 +975,13 @@ function drawDailyChart(days) {
   }
 }
 
-window.addEventListener('resize', () => drawDailyChart(lastDailyDays));
+function drawDailyChart(days) { drawChart('daily-chart', 'daily-legend', days, null); }
+function drawMeteoFranceChart(days) { drawChart('mf-chart', 'mf-legend', days, ['penman_monteith', 'meteofrance']); }
+
+window.addEventListener('resize', () => {
+  drawDailyChart(lastDailyDays);
+  if (!document.getElementById('view-meteofrance').hidden) drawMeteoFranceChart(lastDailyDays);
+});
 
 loadStations();
 setInterval(refresh, 30_000);
