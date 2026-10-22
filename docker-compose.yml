@@ -15,16 +15,11 @@ services:
       LATITUDE: ${LATITUDE:-48.8566}       # decimal degrees, positive = North
       LONGITUDE: ${LONGITUDE:-2.3522}       # decimal degrees, positive = East
       # LONGITUDE isn't used by the ET0 formula itself (only latitude +
-      # elevation are) - it's only used to look up the nearest Météo France
-      # ETPgrille comparison point below.
+      # elevation are) - only the meteofrance driver below needs it, to look
+      # up the nearest ETPgrille point.
       ELEVATION: ${ELEVATION:-100}          # metres above sea level
       # Height of the station anemometer above ground (metres)
       ANEMOMETER_HEIGHT: ${ANEMOMETER_HEIGHT:-2.0}
-      # Comparison-only: daily ET0 from Météo France's ETPgrille (interpolated
-      # 0.125° model grid, not derived from this station's own data - expect
-      # it to diverge more in areas with strong local relief/microclimate).
-      # Set to 0 to disable.
-      METEOFRANCE_ENABLED: ${METEOFRANCE_ENABLED:-1}
       HTTP_PORT: ${HTTP_PORT:-8080}
       # IANA timezone for CSV export day boundaries, e.g. Europe/Paris
       TIMEZONE: ${TIMEZONE:-Europe/Paris}
@@ -32,12 +27,17 @@ services:
       # into hourly min/max/mean buckets (kept forever); default 1 year so any
       # future ET0 method can be recomputed at full precision over real history
       OBSERVATION_RETENTION_HOURS: ${OBSERVATION_RETENTION_HOURS:-8760}
-      # Weather station driver(s) (see stations/__init__.py): tempest | ecowitt | pwsweather
+      # Weather station driver(s) (see stations/__init__.py):
+      # tempest | ecowitt | pwsweather | meteofrance
       # Comma-separate "type" or "type:instance" entries to run several at
       # once (one DB + ETP each), e.g. tempest,ecowitt or
       # pwsweather:STATION1,pwsweather:STATION2 for two same-vendor stations
       # (currently only PWSWeather supports two live instances at once -
-      # Tempest/Ecowitt still need listener-sharing work for that)
+      # Tempest/Ecowitt still need listener-sharing work for that). "meteofrance"
+      # has no raw sensor data of its own - it republishes Météo France's own
+      # published daily ET0 (https://explore.data.gouv.fr/fr/datasets/661d079b6357625e12013241/)
+      # for the LATITUDE/LONGITUDE above, for sites without a local station, or
+      # for comparison against one, e.g. tempest,meteofrance.
       STATION_TYPE: ${STATION_TYPE:-tempest}
       # Ecowitt only: port the gateway's "Customized" upload (Ecowitt protocol)
       # posts to, and optional PASSKEY filter (logged on first upload)

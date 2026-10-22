@@ -10,7 +10,6 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import export
-import meteofrance
 from calculator import compute_etp
 from database import Database
 from stations import WeatherStationListener, create_listener
@@ -25,11 +24,12 @@ GIT_SHA = os.environ.get("GIT_SHA", "unknown")
 logger.info("Starting weather-station-etp, commit=%s", GIT_SHA)
 
 LATITUDE          = float(os.environ.get("LATITUDE", "48.8566"))
+# Not used by the ET0 formula itself (only latitude + elevation are) -
+# only needed by station types that look up a location-indexed external
+# dataset (stations/meteofrance.py).
 LONGITUDE         = float(os.environ.get("LONGITUDE", "2.3522"))
 ELEVATION         = float(os.environ.get("ELEVATION", "100"))
 ANEMOMETER_HEIGHT = float(os.environ.get("ANEMOMETER_HEIGHT", "2.0"))
-# Météo France ETPgrille comparison (see meteofrance.py); 0 disables it.
-METEOFRANCE_ENABLED = os.environ.get("METEOFRANCE_ENABLED", "1") not in ("0", "false", "False")
 DATA_DIR          = os.environ.get("DATA_DIR", "/data")
 # How long raw per-minute observations are kept at full resolution before
 # being downsampled into hourly min/max/mean buckets (kept indefinitely —
@@ -116,6 +116,8 @@ def _station(name: str | None) -> WeatherStationListener:
 
 def run_etp():
     for name, st in stations.items():
+        if not st.computes_own_etp:
+            continue  # e.g. meteofrance: refreshed on its own schedule in _run(), nothing to compute here
         try:
             latitude = st.latitude if st.latitude is not None else LATITUDE
             elevation = st.elevation if st.elevation is not None else ELEVATION
@@ -138,28 +140,6 @@ def run_archive():
             logger.info("[%s] Archived %d hourly bucket(s) of raw observations", name, written)
 
 
-def run_meteofrance_refresh():
-    """Comparison-only: refresh each station's nearest Météo France
-    ETPgrille grid point for the current year (and, in January, the tail
-    of last year too, since that grid point's file for the new year won't
-    have it yet). Runs on a schedule, not inline with the hourly ETP
-    computation, since it's a ~4 MB network fetch."""
-    if not METEOFRANCE_ENABLED:
-        return
-    today = date.today()
-    years = [today.year] if today.month > 1 else [today.year - 1, today.year]
-    for name, st in stations.items():
-        lat = st.latitude if st.latitude is not None else st.default_latitude
-        lon = st.longitude if st.longitude is not None else st.default_longitude
-        for year in years:
-            try:
-                grid_point, series = meteofrance.fetch_year(lat, lon, year)
-                st.db.upsert_meteofrance_etp(grid_point, series)
-                logger.info("[%s] Météo France grid %s: %d day(s) for %d", name, grid_point, len(series), year)
-            except Exception:
-                logger.exception("[%s] Météo France refresh failed for %d", name, year)
-
-
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for st in stations.values():
@@ -167,13 +147,6 @@ async def lifespan(app: FastAPI):
         st.start()
     sched.add_job(run_etp,     "cron", minute=0)       # top of every hour
     sched.add_job(run_archive, "cron", hour=3, minute=0)  # daily downsample + purge
-    # Météo France typically publishes the updated current-year file around
-    # 08:00 UTC (observed, not documented - may drift); run a couple hours
-    # after that rather than at run_archive's hour=3 so this actually picks
-    # up the freshest day instead of running a stale fetch and waiting
-    # another 24h for it.
-    sched.add_job(run_meteofrance_refresh, "cron", hour=10, minute=0)
-    sched.add_job(run_meteofrance_refresh, "date", run_date=datetime.now())  # once, in the background
     sched.start()
     run_etp()   # immediate first computation on startup
     yield
@@ -191,7 +164,10 @@ def _iso(ts: int | None) -> str | None:
 
 def _station_status(st: WeatherStationListener) -> dict:
     obs = st.db.get_latest_observation()
-    last_ts = obs["timestamp"] if obs else None
+    # Falls back to the listener's own last_seen for a driver with no raw
+    # observations at all (stations/meteofrance.py) - otherwise it would
+    # always read as disconnected even right after a successful refresh.
+    last_ts = obs["timestamp"] if obs else (int(st.last_seen) if st.last_seen else None)
     return {
         "station_type": st.name,
         "station_connected": last_ts is not None and (time.time() - last_ts) < st.stale_after,
@@ -207,23 +183,22 @@ def list_stations():
 @app.get("/health")
 def health(station: str | None = None):
     st = _station(station)
-    mf_lat = st.latitude if st.latitude is not None else st.default_latitude
-    mf_lon = st.longitude if st.longitude is not None else st.default_longitude
     return {
         "status": "ok",
         "commit": GIT_SHA,
         **_station_status(st),
         "latitude": st.latitude if st.latitude is not None else LATITUDE,
+        "longitude": st.longitude if st.longitude is not None else LONGITUDE,
         "elevation_m": st.elevation if st.elevation is not None else ELEVATION,
         "location_source": "station" if st.latitude is not None else "env",
         "anemometer_height_m": ANEMOMETER_HEIGHT,
         "observation_retention_days": round(OBSERVATION_RETENTION_HOURS / 24, 1),
-        # Surfaced mainly for debugging: if longitude isn't learned from a
-        # station API (only PWSWeather does) and LONGITUDE isn't set, this
-        # silently falls back to the default below - easy to miss, so make
-        # the actual lat/lon used for the grid lookup visible here.
-        "meteofrance_source_latlon": [mf_lat, mf_lon],
-        "meteofrance_grid_point": st.db.get_meteofrance_grid_point(),
+        # Present only for drivers that resolve an external location-indexed
+        # grid point (stations/meteofrance.py) - surfaced mainly so a
+        # longitude that silently fell back to the default above (e.g. not
+        # learned from an API, and LONGITUDE not set) is visible here rather
+        # than only showing up as a wrong-looking grid point in the data.
+        **({"meteofrance_grid_point": st.grid_point} if getattr(st, "grid_point", None) else {}),
     }
 
 
@@ -289,14 +264,6 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
         if day not in best or dist < best[day][0]:
             best[day] = (dist, r)
 
-    # Comparison-only (see meteofrance.py) - not computed from this
-    # station's own data, so it's simply missing (None) for any day the
-    # grid refresh hasn't reached yet (not yet published, or refresh failed).
-    mf_days = sorted(best)
-    meteofrance_etp = (
-        _station(station).db.get_meteofrance_etp(mf_days[0], mf_days[-1]) if mf_days else {}
-    )
-
     return {
         "days": [
             {
@@ -305,7 +272,6 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
                 "et0_alt_mm":          r["et0_alt_mm"],
                 "observation_count":   r["observation_count"],
                 "midnight_offset_min": round(dist / 60, 1),
-                "meteofrance_etp_mm":  meteofrance_etp.get(day),
             }
             for day, (dist, r) in sorted(best.items())
         ]
@@ -590,22 +556,6 @@ _HTML = """<!DOCTYPE html>
   </div>
   </div>
 
-  <div id="view-meteofrance" hidden>
-  <h2>Météo France ETPgrille — comparison</h2>
-  <div class="card" style="margin-bottom:1.5rem">
-    <div class="sub">
-      Daily ET0 interpolated onto a 0.125° grid, inverse-distance-squared from the 5 nearest
-      official stations - no altitude correction, so expect real divergence here in terrain with
-      strong local relief. Comparison only: never used to compute this station's own ETP.
-    </div>
-    <div style="margin-top:.75rem;font-size:.8rem;color:#94a3b8" id="mf-info">loading…</div>
-  </div>
-  <div class="card">
-    <canvas id="mf-chart" height="260" style="width:100%;max-width:100%"></canvas>
-    <div id="mf-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
-  </div>
-  </div>
-
 <script>
 const fmt = v => v != null ? v : '—';
 const fmtDt = iso => iso ? new Date(iso).toLocaleString() : '—';
@@ -616,7 +566,6 @@ const methodLabel = {
   priestley_taylor:  'Priestley-Taylor',
   makkink:           'Makkink',
   turc:              'Turc',
-  meteofrance:       'Météo France (grid, comparison only)',
 };
 const methodColor = {
   penman_monteith:   '#7dd3fc',
@@ -624,7 +573,6 @@ const methodColor = {
   priestley_taylor:  '#34d399',
   makkink:           '#fbbf24',
   turc:              '#c084fc',
-  meteofrance:       '#f472b6',
 };
 
 let lastDailyDays = [];
@@ -638,56 +586,17 @@ const q = (path, extra = '') => `${path}?station=${encodeURIComponent(station)}$
 async function loadStations() {
   const { stations = [] } = await fetch('/api/stations').then(r => r.json()).catch(() => ({}));
   const names = stations.map(s => s.station_type);
-  const startOnMeteoFrance = location.hash.slice(1) === 'meteofrance';
   station = names.includes(location.hash.slice(1)) ? location.hash.slice(1) : names[0];
   const tabs = document.getElementById('tabs');
-  tabs.hidden = false;  // always >= 1 real station + the Météo France tab
-  tabs.innerHTML =
-    names.map(n => `<button class="tab" data-st="${n}">${n}</button>`).join('') +
-    `<button class="tab" data-mf="1">Météo France</button>`;
+  tabs.hidden = names.length < 2;
+  tabs.innerHTML = names.map(n => `<button class="tab" data-st="${n}">${n}</button>`).join('');
   tabs.onclick = e => {
-    if (e.target.dataset.mf) { location.hash = 'meteofrance'; showMeteoFranceView(); return; }
     if (!e.target.dataset.st) return;
     station = e.target.dataset.st;
     location.hash = station;
-    showStationView();
     selectStation();
   };
-  if (startOnMeteoFrance) { showMeteoFranceView(); } else { selectStation(); }
-}
-
-function showStationView() {
-  document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.st === station));
-  document.getElementById('view-tabs').hidden = false;
-  document.getElementById('view-meteofrance').hidden = true;
-  const active = document.querySelector('#view-tabs .tab.active')?.dataset.view || 'overview';
-  document.getElementById('view-overview').hidden = active !== 'overview';
-  document.getElementById('view-chart').hidden = active !== 'chart';
-  document.getElementById('view-browse').hidden = active !== 'browse';
-}
-
-async function showMeteoFranceView() {
-  document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', !!t.dataset.mf));
-  document.getElementById('view-tabs').hidden = true;
-  document.getElementById('view-overview').hidden = true;
-  document.getElementById('view-chart').hidden = true;
-  document.getElementById('view-browse').hidden = true;
-  document.getElementById('view-meteofrance').hidden = false;
-
-  const health = await fetch(q('/health')).then(r => r.json()).catch(() => ({}));
-  const info = document.getElementById('mf-info');
-  const [slat, slon] = health.meteofrance_source_latlon || [];
-  const grid = health.meteofrance_grid_point;
-  if (slat == null || !grid) {
-    info.textContent = 'No grid data yet - the daily refresh job may not have run yet (runs once on startup, otherwise 10:00 UTC).';
-  } else {
-    const [glon, glat] = grid;
-    const kmPerDeg = 111;
-    const distKm = Math.hypot((glat - slat) * kmPerDeg, (glon - slon) * kmPerDeg * Math.cos(slat * Math.PI / 180));
-    info.innerHTML = `Station "${station}" at (${slat.toFixed(4)}, ${slon.toFixed(4)}) → nearest grid point ` +
-      `(${glat.toFixed(3)}, ${glon.toFixed(3)}), ~${distKm.toFixed(1)} km away.`;
-  }
-  await loadDaily();
+  selectStation();
 }
 
 document.getElementById('view-tabs').onclick = e => {
@@ -730,7 +639,6 @@ async function loadDaily() {
   const daily = await fetch(q('/api/etp/daily', extra)).then(r => r.ok ? r.json() : null).catch(() => null);
   lastDailyDays = daily?.days || [];
   drawDailyChart(lastDailyDays);
-  if (!document.getElementById('view-meteofrance').hidden) drawMeteoFranceChart(lastDailyDays);
 }
 
 const fmtNum = decimals => v => v != null ? v.toFixed(decimals) : '—';
@@ -890,14 +798,14 @@ async function refresh() {
         `<tr>
           <td>${fmtDt(e.computed_at)}</td>
           <td>${e.et0_mm_per_day.toFixed(3)}</td>
-          <td>${e.observation_count}</td>
+          <td>${fmt(e.observation_count)}</td>
         </tr>`
       ).join('');
 }
 
-function drawChart(canvasId, legendId, days, methods) {
-  const canvas = document.getElementById(canvasId);
-  const legendEl = document.getElementById(legendId);
+function drawDailyChart(days) {
+  const canvas = document.getElementById('daily-chart');
+  const legendEl = document.getElementById('daily-legend');
   const ctx = canvas.getContext('2d');
   const dpr = window.devicePixelRatio || 1;
   const W = canvas.clientWidth || 600;
@@ -921,15 +829,7 @@ function drawChart(canvasId, legendId, days, methods) {
     for (const [method, value] of Object.entries(d.et0_alt_mm)) {
       (series[method] ??= Array(days.length).fill(null))[i] = value;
     }
-    if (d.meteofrance_etp_mm != null) {
-      (series.meteofrance ??= Array(days.length).fill(null))[i] = d.meteofrance_etp_mm;
-    }
   });
-  if (methods) {
-    for (const key of Object.keys(series)) {
-      if (!methods.includes(key)) delete series[key];
-    }
-  }
 
   const allValues = Object.values(series).flat().filter(v => v != null);
   const yMax = Math.max(...allValues, 0.1) * 1.1;
@@ -975,13 +875,7 @@ function drawChart(canvasId, legendId, days, methods) {
   }
 }
 
-function drawDailyChart(days) { drawChart('daily-chart', 'daily-legend', days, null); }
-function drawMeteoFranceChart(days) { drawChart('mf-chart', 'mf-legend', days, ['penman_monteith', 'meteofrance']); }
-
-window.addEventListener('resize', () => {
-  drawDailyChart(lastDailyDays);
-  if (!document.getElementById('view-meteofrance').hidden) drawMeteoFranceChart(lastDailyDays);
-});
+window.addEventListener('resize', () => drawDailyChart(lastDailyDays));
 
 loadStations();
 setInterval(refresh, 30_000);

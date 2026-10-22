@@ -63,18 +63,13 @@ class Database:
                     et0_alt_mm      TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_etp_ts ON etp_results(computed_at);
-
-                -- Comparison-only: Météo France ETPgrille, for the grid
-                -- point nearest this station (see meteofrance.py). One row
-                -- per calendar day; grid_lon/grid_lat repeated on every row
-                -- rather than kept elsewhere, so this table alone is
-                -- self-describing.
-                CREATE TABLE IF NOT EXISTS meteofrance_etp (
-                    date     TEXT PRIMARY KEY,
-                    grid_lon REAL NOT NULL,
-                    grid_lat REAL NOT NULL,
-                    etp_mm   REAL NOT NULL
-                );
+                -- One row per window_end: the normal hourly compute_etp cron
+                -- never produces two rows for the same wall-clock window_end,
+                -- but a station type that republishes an externally-published
+                -- per-day value (e.g. stations/meteofrance.py) needs
+                -- store_etp() to be an idempotent upsert rather than growing
+                -- a duplicate row every refresh.
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_etp_window_end ON etp_results(window_end);
             """)
             # Migration for DBs created before et0_alt_mm existed.
             columns = {row["name"] for row in c.execute("PRAGMA table_info(etp_results)")}
@@ -124,11 +119,20 @@ class Database:
         return dict(row) if row else None
 
     def store_etp(self, result: dict):
+        """Upsert keyed by window_end (see idx_etp_window_end): the normal
+        hourly cron always produces a fresh window_end so this behaves like
+        a plain insert for it, but a station that republishes an externally
+        -published per-day value (stations/meteofrance.py) can safely
+        re-store the same day on every refresh without growing duplicates."""
         with self._conn() as c:
             c.execute(
                 """INSERT INTO etp_results
                    (computed_at, window_start, window_end, et0_mm, observation_count, et0_alt_mm)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(window_end) DO UPDATE SET
+                       computed_at=excluded.computed_at, window_start=excluded.window_start,
+                       et0_mm=excluded.et0_mm, observation_count=excluded.observation_count,
+                       et0_alt_mm=excluded.et0_alt_mm""",
                 (result["computed_at"], result["window_start"], result["window_end"],
                  result["et0_mm"], result["observation_count"],
                  json.dumps(result.get("et0_alt_mm")) if result.get("et0_alt_mm") else None),
@@ -142,53 +146,37 @@ class Database:
     def get_latest_etp(self) -> dict | None:
         with self._conn() as c:
             row = c.execute(
-                "SELECT * FROM etp_results ORDER BY computed_at DESC LIMIT 1"
+                "SELECT * FROM etp_results ORDER BY window_end DESC LIMIT 1"
             ).fetchone()
         return self._decode_etp(dict(row)) if row else None
 
     def get_etp_history(self, limit: int = 48) -> list[dict]:
         with self._conn() as c:
             rows = c.execute(
-                "SELECT * FROM etp_results ORDER BY computed_at DESC LIMIT ?",
+                "SELECT * FROM etp_results ORDER BY window_end DESC LIMIT ?",
                 (limit,),
             ).fetchall()
         return [self._decode_etp(dict(r)) for r in rows]
 
     def get_etp_range(self, start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
-        """Hourly ETP computations (never purged) between start_ts (inclusive) and
-        end_ts (exclusive); unbounded on either side when None. Oldest first."""
+        """ETP results (never purged) whose window_end falls between start_ts
+        (inclusive) and end_ts (exclusive); unbounded on either side when
+        None. Oldest first. Filtered by window_end (the period a row is
+        *about*), not computed_at (when it was learned) - those are nearly
+        identical for the normal hourly cron, but can diverge a lot for a
+        station that republishes historical days in one batch (e.g.
+        stations/meteofrance.py backfilling a whole year on each refresh)."""
         query, params = "SELECT * FROM etp_results WHERE 1=1", []
         if start_ts is not None:
-            query += " AND computed_at >= ?"
+            query += " AND window_end >= ?"
             params.append(start_ts)
         if end_ts is not None:
-            query += " AND computed_at < ?"
+            query += " AND window_end < ?"
             params.append(end_ts)
-        query += " ORDER BY computed_at ASC"
+        query += " ORDER BY window_end ASC"
         with self._conn() as c:
             rows = c.execute(query, params).fetchall()
         return [self._decode_etp(dict(r)) for r in rows]
-
-    def upsert_meteofrance_etp(self, grid_point: tuple[float, float], series: dict[date, float]):
-        glon, glat = grid_point
-        with self._conn() as c:
-            c.executemany(
-                "INSERT OR REPLACE INTO meteofrance_etp (date, grid_lon, grid_lat, etp_mm) VALUES (?, ?, ?, ?)",
-                [(d.isoformat(), glon, glat, etp) for d, etp in series.items()],
-            )
-
-    def get_meteofrance_etp(self, start_day: date, end_day: date) -> dict[date, float]:
-        with self._conn() as c:
-            rows = c.execute(
-                "SELECT date, etp_mm FROM meteofrance_etp WHERE date >= ? AND date <= ?",
-                (start_day.isoformat(), end_day.isoformat()),
-            ).fetchall()
-        return {date.fromisoformat(r["date"]): r["etp_mm"] for r in rows}
-
-    def get_meteofrance_grid_point(self) -> tuple[float, float] | None:
-        with self._conn() as c:
-            row = c.execute("SELECT grid_lon, grid_lat FROM meteofrance_etp LIMIT 1").fetchone()
-        return (row["grid_lon"], row["grid_lat"]) if row else None
 
     def get_range(self, start_ts: int, end_ts: int) -> list[dict]:
         with self._conn() as c:

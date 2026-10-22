@@ -1,5 +1,6 @@
 from .base import Observation, WeatherStationListener
 from .ecowitt import EcowittListener
+from .meteofrance import MeteoFranceListener
 from .pwsweather import PWSWeatherListener
 from .tempest import TempestListener
 
@@ -8,6 +9,7 @@ DRIVERS: dict[str, type[WeatherStationListener]] = {
     TempestListener.name: TempestListener,
     EcowittListener.name: EcowittListener,
     PWSWeatherListener.name: PWSWeatherListener,
+    MeteoFranceListener.name: MeteoFranceListener,
 }
 
 
@@ -23,5 +25,5 @@ def create_listener(station_type: str, db, instance_id: str | None = None) -> We
 
 __all__ = [
     "Observation", "WeatherStationListener", "TempestListener", "EcowittListener",
-    "PWSWeatherListener", "DRIVERS", "create_listener",
+    "PWSWeatherListener", "MeteoFranceListener", "DRIVERS", "create_listener",
 ]

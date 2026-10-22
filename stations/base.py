@@ -33,6 +33,11 @@ class WeatherStationListener(ABC):
     """
 
     name: str = "station"
+    # False for a driver that publishes ET0 it didn't compute itself
+    # (stations/meteofrance.py republishes an externally-published value
+    # directly into etp_results) - main.py's hourly compute_etp pass skips
+    # these, since they have no raw observations to compute anything from.
+    computes_own_etp: bool = True
     # Seconds since the last observation after which a station is considered
     # disconnected; override for drivers that poll on a longer interval.
     stale_after: float = 120
