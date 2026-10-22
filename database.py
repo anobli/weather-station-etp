@@ -31,7 +31,10 @@ class Database:
                     wind_speed   REAL,
                     solar_radiation REAL,
                     pressure     REAL,
-                    dew_point    REAL
+                    dew_point    REAL,
+                    latitude     REAL,
+                    elevation    REAL,
+                    anemometer_height REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(timestamp);
 
@@ -42,6 +45,8 @@ class Database:
                     wind_speed_min REAL, wind_speed_max REAL, wind_speed_mean REAL,
                     solar_radiation_min REAL, solar_radiation_max REAL, solar_radiation_mean REAL,
                     pressure_min REAL, pressure_max REAL, pressure_mean REAL,
+                    dew_point_min REAL, dew_point_max REAL, dew_point_mean REAL,
+                    latitude_mean REAL, elevation_mean REAL, anemometer_height_mean REAL,
                     sample_count INTEGER NOT NULL
                 );
 
@@ -61,19 +66,30 @@ class Database:
             if "et0_alt_mm" not in columns:
                 c.execute("ALTER TABLE etp_results ADD COLUMN et0_alt_mm TEXT")
 
-            # Migration for DBs created before dew_point existed.
+            # Migration for DBs created before dew_point/latitude/elevation/
+            # anemometer_height existed.
             columns = {row["name"] for row in c.execute("PRAGMA table_info(observations)")}
-            if "dew_point" not in columns:
-                c.execute("ALTER TABLE observations ADD COLUMN dew_point REAL")
+            for col in ("dew_point", "latitude", "elevation", "anemometer_height"):
+                if col not in columns:
+                    c.execute(f"ALTER TABLE observations ADD COLUMN {col} REAL")
+
+            # Same, for observations_hourly.
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(observations_hourly)")}
+            for col in ("dew_point_min", "dew_point_max", "dew_point_mean",
+                        "latitude_mean", "elevation_mean", "anemometer_height_mean"):
+                if col not in columns:
+                    c.execute(f"ALTER TABLE observations_hourly ADD COLUMN {col} REAL")
 
     def insert_observation(self, obs: dict):
         with self._conn() as c:
             c.execute(
                 """INSERT OR REPLACE INTO observations
-                   (timestamp, temperature, humidity, wind_speed, solar_radiation, pressure, dew_point)
-                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                   (timestamp, temperature, humidity, wind_speed, solar_radiation, pressure, dew_point,
+                    latitude, elevation, anemometer_height)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (obs["timestamp"], obs["temperature"], obs["humidity"],
-                 obs["wind_speed"], obs["solar_radiation"], obs["pressure"], obs.get("dew_point")),
+                 obs["wind_speed"], obs["solar_radiation"], obs["pressure"], obs.get("dew_point"),
+                 obs.get("latitude"), obs.get("elevation"), obs.get("anemometer_height")),
             )
 
     def get_window(self, hours: int = 24) -> list[dict]:
@@ -168,13 +184,17 @@ class Database:
                     humidity_min, humidity_max, humidity_mean,
                     wind_speed_min, wind_speed_max, wind_speed_mean,
                     solar_radiation_min, solar_radiation_max, solar_radiation_mean,
-                    pressure_min, pressure_max, pressure_mean, sample_count)
+                    pressure_min, pressure_max, pressure_mean,
+                    dew_point_min, dew_point_max, dew_point_mean,
+                    latitude_mean, elevation_mean, anemometer_height_mean, sample_count)
                    SELECT (timestamp / 3600) * 3600,
                           MIN(temperature), MAX(temperature), AVG(temperature),
                           MIN(humidity), MAX(humidity), AVG(humidity),
                           MIN(wind_speed), MAX(wind_speed), AVG(wind_speed),
                           MIN(solar_radiation), MAX(solar_radiation), AVG(solar_radiation),
                           MIN(pressure), MAX(pressure), AVG(pressure),
+                          MIN(dew_point), MAX(dew_point), AVG(dew_point),
+                          AVG(latitude), AVG(elevation), AVG(anemometer_height),
                           COUNT(*)
                    FROM observations
                    WHERE timestamp < ?

@@ -44,6 +44,20 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     solars  = [o["solar_radiation"] for o in obs if o["solar_radiation"] is not None]
     dews    = [o["dew_point"] for o in obs if o.get("dew_point") is not None]
 
+    # Prefer the latitude/elevation/anemometer_height recorded on each row
+    # (in effect when it was observed) over the caller's current config, so
+    # a CSV export of `obs` alone is enough to recompute this exact result
+    # later even if the live config has since changed.
+    lats  = [o["latitude"] for o in obs if o.get("latitude") is not None]
+    elevs = [o["elevation"] for o in obs if o.get("elevation") is not None]
+    anems = [o["anemometer_height"] for o in obs if o.get("anemometer_height") is not None]
+    if lats:
+        latitude = sum(lats) / len(lats)
+    if elevs:
+        elevation = sum(elevs) / len(elevs)
+    if anems:
+        anemometer_height = sum(anems) / len(anems)
+
     T_mean = sum(temps) / len(temps)
     T_max  = max(temps)
     T_min  = min(temps)

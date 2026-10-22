@@ -94,6 +94,8 @@ stations: dict[str, WeatherStationListener] = {
     instance_key: create_listener(station_type, Database(_db_path(instance_key)), instance_id=instance_id)
     for instance_key, station_type, instance_id in STATION_ENTRIES
 }
+for st in stations.values():
+    st.default_latitude, st.default_elevation, st.anemometer_height = LATITUDE, ELEVATION, ANEMOMETER_HEIGHT
 sched = BackgroundScheduler()
 
 

@@ -16,6 +16,12 @@ class Observation(TypedDict):
     solar_radiation: float | None  # global solar radiation (W/m²)
     pressure:        float | None  # station pressure (hPa)
     dew_point:       float | None  # dew point (°C), when the station reports it directly
+    # Location/instrument config as in effect when this row was recorded,
+    # carried on every row (not just configured once elsewhere) so a CSV
+    # export alone has everything needed to recompute ET0.
+    latitude:          float | None  # site latitude (decimal degrees)
+    elevation:         float | None  # site elevation (m)
+    anemometer_height: float | None  # wind sensor height (m)
 
 
 class WeatherStationListener(ABC):
@@ -47,6 +53,14 @@ class WeatherStationListener(ABC):
         # configured station and easy to leave at a wrong/default value.
         self.latitude: float | None = None
         self.elevation: float | None = None
+        # Fallback location/instrument config for drivers that never learn
+        # their own from an API (Tempest, Ecowitt) - main.py overwrites
+        # these from the LATITUDE/ELEVATION/ANEMOMETER_HEIGHT env vars right
+        # after construction. publish() stamps every row with whichever of
+        # latitude/elevation/anemometer_height is in effect.
+        self.default_latitude: float = 48.8566
+        self.default_elevation: float = 100.0
+        self.anemometer_height: float = 2.0
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"{self.name}-listener")
@@ -63,6 +77,10 @@ class WeatherStationListener(ABC):
     def publish(self, record: Observation):
         if record.get("temperature") is None or record.get("humidity") is None:
             return
+        record = dict(record)
+        record.setdefault("latitude", self.latitude if self.latitude is not None else self.default_latitude)
+        record.setdefault("elevation", self.elevation if self.elevation is not None else self.default_elevation)
+        record.setdefault("anemometer_height", self.anemometer_height)
         try:
             self.db.insert_observation(record)
             self.last_seen = time.time()
