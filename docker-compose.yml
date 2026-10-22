@@ -46,6 +46,11 @@ services:
       PWSWEATHER_STATION_ID: ${PWSWEATHER_STATION_ID:-}
       PWSWEATHER_API_KEY: ${PWSWEATHER_API_KEY:-}
       PWSWEATHER_POLL_SECONDS: ${PWSWEATHER_POLL_SECONDS:-300}
+      # On first boot with an empty DB (fresh deploy, or a fresh volume),
+      # backfill this many days of history from Xweather's archive endpoint
+      # before starting live polling, so ET0/the dashboard aren't stuck
+      # waiting for live polls to accumulate data. 0 disables it.
+      PWSWEATHER_BACKFILL_DAYS: ${PWSWEATHER_BACKFILL_DAYS:-7}
       DATA_DIR: /data
     volumes:
       - ./data:/data

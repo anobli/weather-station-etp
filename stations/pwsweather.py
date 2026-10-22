@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import time
 import urllib.error
 import urllib.request
+from datetime import date, timedelta
 from urllib.parse import quote, urlencode
 
 from .base import Observation, WeatherStationListener
@@ -14,7 +16,15 @@ logger = logging.getLogger(__name__)
 # account: https://www.xweather.com/ -> client_id/client_secret, issued by
 # self-serve trial signups as a single "API key" shaped CLIENTID_SECRET.
 API_BASE = "https://data.api.xweather.com/observations"
+# Historical data (2011-08-02 to now); returns one full station-local day
+# per call regardless of time-of-day in `from`, and has no `to` parameter.
+ARCHIVE_API_BASE = "https://data.api.xweather.com/observations/archive"
 POLL_SECONDS_DEFAULT = 300
+# How many days of history to backfill from the archive endpoint when a
+# station starts with an empty DB (e.g. first deploy, or a fresh volume) -
+# so ET0 and the dashboard have useful data immediately instead of waiting
+# for live polling to accumulate it one poll at a time. 0 disables it.
+BACKFILL_DAYS_DEFAULT = 7
 
 
 def _split_api_key(key: str) -> tuple[str, str]:
@@ -61,6 +71,7 @@ class PWSWeatherListener(WeatherStationListener):
                 self.client_id, self.client_secret = _split_api_key(api_key)
         self.poll_seconds = poll_seconds or int(os.environ.get("PWSWEATHER_POLL_SECONDS", POLL_SECONDS_DEFAULT))
         self.stale_after = self.poll_seconds * 2 + 60
+        self.backfill_days = int(os.environ.get("PWSWEATHER_BACKFILL_DAYS", BACKFILL_DAYS_DEFAULT))
         if not self.station_id:
             raise ValueError("PWSWEATHER_STATION_ID is required for the pwsweather driver")
         if not self.client_id or not self.client_secret:
@@ -71,6 +82,24 @@ class PWSWeatherListener(WeatherStationListener):
         self._last_timestamp: int | None = None
 
     def _run(self):
+        if self.backfill_days > 0:
+            end = date.today()
+            earliest = self.db.earliest_observation_day()
+            # No local data at all: bootstrap a bounded recent window. Some
+            # local data: scan all of it (not just that window) for gaps
+            # (downtime) or rows missing a field added after they were
+            # recorded (dew_point, latitude, ...) - re-running this after
+            # adding a new field backfills it everywhere without needing to
+            # wipe the DB.
+            start = earliest if earliest is not None else end - timedelta(days=self.backfill_days - 1)
+            gap_days = self.db.incomplete_days(start, end)
+            if gap_days:
+                logger.info(
+                    "%s: backfilling %d incomplete/missing day(s) from the archive (%s to %s)",
+                    self.station_id, len(gap_days), gap_days[0], gap_days[-1],
+                )
+                self.backfill(gap_days)
+
         logger.info("Polling PWSWeather station %s every %ds", self.station_id, self.poll_seconds)
         while not self._stop.is_set():
             try:
@@ -79,6 +108,30 @@ class PWSWeatherListener(WeatherStationListener):
                 logger.error("PWSWeather poll error: %s", e)
             if self._stop.wait(self.poll_seconds):
                 break
+
+    def _record_from_ob(self, ob: dict) -> Observation:
+        return {
+            "timestamp":       int(ob["timestamp"]),
+            "temperature":     ob.get("tempC"),
+            "humidity":        ob.get("humidity"),
+            "wind_speed":      ob.get("windSpeedMPS"),
+            "solar_radiation": ob.get("solradWM2"),
+            "pressure":        ob.get("spressureMB", ob.get("pressureMB")),
+            "dew_point":       ob.get("dewpointC"),
+        }
+
+    def _learn_location(self, response: dict):
+        if self.latitude is not None and self.elevation is not None:
+            return
+        loc = response.get("loc") or {}
+        profile = response.get("profile") or {}
+        lat, elev = loc.get("lat"), profile.get("elevM")
+        if lat is not None and elev is not None:
+            self.latitude, self.elevation = lat, elev
+            logger.info(
+                "PWSWeather station %s registered at lat=%s elevation=%sm (overrides LATITUDE/ELEVATION env)",
+                self.station_id, lat, elev,
+            )
 
     def _poll(self):
         url = f"{API_BASE}/{quote(self.station_id)}?" + urlencode({
@@ -103,24 +156,44 @@ class PWSWeatherListener(WeatherStationListener):
             return  # nothing new since the last poll
         self._last_timestamp = timestamp
 
-        if self.latitude is None or self.elevation is None:
-            loc = response.get("loc") or {}
-            profile = response.get("profile") or {}
-            lat, elev = loc.get("lat"), profile.get("elevM")
-            if lat is not None and elev is not None:
-                self.latitude, self.elevation = lat, elev
-                logger.info(
-                    "PWSWeather station %s registered at lat=%s elevation=%sm (overrides LATITUDE/ELEVATION env)",
-                    self.station_id, lat, elev,
-                )
+        self._learn_location(response)
+        self.publish(self._record_from_ob(ob))
 
-        record: Observation = {
-            "timestamp":       int(timestamp),
-            "temperature":     ob.get("tempC"),
-            "humidity":        ob.get("humidity"),
-            "wind_speed":      ob.get("windSpeedMPS"),
-            "solar_radiation": ob.get("solradWM2"),
-            "pressure":        ob.get("spressureMB", ob.get("pressureMB")),
-            "dew_point":       ob.get("dewpointC"),
-        }
-        self.publish(record)
+    def backfill(self, days: list[date]):
+        """Fetch and store every observation for each day in `days`
+        (station-local calendar days) from Xweather's archive endpoint - one
+        request per day, since that's all it returns per call. Safe to
+        re-run: insert_observation is INSERT OR REPLACE keyed by timestamp,
+        so re-fetching a day just overwrites it with the same (or more
+        complete) data.
+        """
+        for i, day in enumerate(days):
+            url = f"{ARCHIVE_API_BASE}/{quote(self.station_id)}?" + urlencode({
+                "from": day.isoformat(),
+                "client_id": self.client_id,
+                "client_secret": self.client_secret,
+            })
+            try:
+                with urllib.request.urlopen(url, timeout=30) as resp:
+                    payload = json.load(resp)
+            except urllib.error.URLError as e:
+                logger.error("PWSWeather archive request failed for %s: %s", day, e)
+                continue
+            finally:
+                if i < len(days) - 1:
+                    time.sleep(1.0)  # politeness between daily archive requests
+
+            if not payload.get("success"):
+                logger.error("PWSWeather archive API error for %s: %s", day, payload.get("error"))
+                continue
+
+            response = payload.get("response") or {}
+            self._learn_location(response)
+            inserted = 0
+            for period in response.get("periods") or []:
+                ob = period.get("ob") or {}
+                if ob.get("timestamp") is None:
+                    continue
+                self.publish(self._record_from_ob(ob))
+                inserted += 1
+            logger.info("[backfill %s] %s: inserted %d observation(s)", self.station_id, day, inserted)

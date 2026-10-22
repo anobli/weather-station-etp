@@ -2,7 +2,10 @@ import json
 import sqlite3
 import time
 from contextlib import contextmanager
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
+
+INCOMPLETE_COLUMNS = ("dew_point", "latitude", "elevation", "anemometer_height")
 
 
 class Database:
@@ -161,6 +164,39 @@ class Database:
                 (start_ts, end_ts),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def earliest_observation_day(self) -> date | None:
+        with self._conn() as c:
+            row = c.execute("SELECT MIN(timestamp) AS t FROM observations").fetchone()
+        return None if row["t"] is None else datetime.fromtimestamp(row["t"], tz=timezone.utc).date()
+
+    def incomplete_days(self, start_day: date, end_day: date) -> list[date]:
+        """UTC calendar days in [start_day, end_day] (inclusive) that have no
+        observations at all, or have at least one observation missing a
+        column in INCOMPLETE_COLUMNS - e.g. rows recorded before dew_point/
+        latitude/elevation/anemometer_height were captured. Lets a backfill
+        re-fetch exactly what's missing instead of a whole range."""
+        start_ts = int(datetime(start_day.year, start_day.month, start_day.day, tzinfo=timezone.utc).timestamp())
+        end_ts = int(datetime(end_day.year, end_day.month, end_day.day, tzinfo=timezone.utc).timestamp()) + 86400
+        incomplete_expr = " OR ".join(f"{col} IS NULL" for col in INCOMPLETE_COLUMNS)
+        with self._conn() as c:
+            rows = c.execute(
+                f"""SELECT (timestamp / 86400) AS day_bucket, COUNT(*) AS cnt,
+                           SUM(CASE WHEN {incomplete_expr} THEN 1 ELSE 0 END) AS incomplete_cnt
+                    FROM observations
+                    WHERE timestamp >= ? AND timestamp < ?
+                    GROUP BY day_bucket""",
+                (start_ts, end_ts),
+            ).fetchall()
+        by_bucket = {r["day_bucket"]: r for r in rows}
+        epoch = date(1970, 1, 1)
+        days = []
+        for i in range((end_day - start_day).days + 1):
+            d = start_day + timedelta(days=i)
+            r = by_bucket.get((d - epoch).days)
+            if r is None or r["cnt"] == 0 or r["incomplete_cnt"] > 0:
+                days.append(d)
+        return days
 
     def get_archive_range(self, start_ts: int, end_ts: int) -> list[dict]:
         with self._conn() as c:
