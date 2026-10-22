@@ -63,13 +63,6 @@ class Database:
                     et0_alt_mm      TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_etp_ts ON etp_results(computed_at);
-                -- One row per window_end: the normal hourly compute_etp cron
-                -- never produces two rows for the same wall-clock window_end,
-                -- but a station type that republishes an externally-published
-                -- per-day value (e.g. stations/meteofrance.py) needs
-                -- store_etp() to be an idempotent upsert rather than growing
-                -- a duplicate row every refresh.
-                CREATE UNIQUE INDEX IF NOT EXISTS idx_etp_window_end ON etp_results(window_end);
             """)
             # Migration for DBs created before et0_alt_mm existed.
             columns = {row["name"] for row in c.execute("PRAGMA table_info(etp_results)")}
@@ -89,6 +82,21 @@ class Database:
                         "latitude_mean", "elevation_mean", "anemometer_height_mean"):
                 if col not in columns:
                     c.execute(f"ALTER TABLE observations_hourly ADD COLUMN {col} REAL")
+
+            # One row per window_end: the normal hourly compute_etp cron
+            # never *intends* two rows for the same wall-clock window_end,
+            # but restarting more than once within the same observation
+            # minute (e.g. during a redeploy) could already have produced
+            # duplicates via the old plain INSERT before this index existed -
+            # dedupe (keep the highest id, i.e. most recently stored) before
+            # adding the index, or its creation fails on exactly that data.
+            indexes = {row["name"] for row in c.execute("PRAGMA index_list(etp_results)")}
+            if "idx_etp_window_end" not in indexes:
+                c.execute(
+                    "DELETE FROM etp_results WHERE id NOT IN "
+                    "(SELECT MAX(id) FROM etp_results GROUP BY window_end)"
+                )
+                c.execute("CREATE UNIQUE INDEX idx_etp_window_end ON etp_results(window_end)")
 
     def insert_observation(self, obs: dict):
         with self._conn() as c:
