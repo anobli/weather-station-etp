@@ -30,7 +30,8 @@ class Database:
                     humidity     REAL,
                     wind_speed   REAL,
                     solar_radiation REAL,
-                    pressure     REAL
+                    pressure     REAL,
+                    dew_point    REAL
                 );
                 CREATE INDEX IF NOT EXISTS idx_obs_ts ON observations(timestamp);
 
@@ -60,14 +61,19 @@ class Database:
             if "et0_alt_mm" not in columns:
                 c.execute("ALTER TABLE etp_results ADD COLUMN et0_alt_mm TEXT")
 
+            # Migration for DBs created before dew_point existed.
+            columns = {row["name"] for row in c.execute("PRAGMA table_info(observations)")}
+            if "dew_point" not in columns:
+                c.execute("ALTER TABLE observations ADD COLUMN dew_point REAL")
+
     def insert_observation(self, obs: dict):
         with self._conn() as c:
             c.execute(
                 """INSERT OR REPLACE INTO observations
-                   (timestamp, temperature, humidity, wind_speed, solar_radiation, pressure)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
+                   (timestamp, temperature, humidity, wind_speed, solar_radiation, pressure, dew_point)
+                   VALUES (?, ?, ?, ?, ?, ?, ?)""",
                 (obs["timestamp"], obs["temperature"], obs["humidity"],
-                 obs["wind_speed"], obs["solar_radiation"], obs["pressure"]),
+                 obs["wind_speed"], obs["solar_radiation"], obs["pressure"], obs.get("dew_point")),
             )
 
     def get_window(self, hours: int = 24) -> list[dict]:

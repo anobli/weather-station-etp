@@ -42,6 +42,7 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     rhs     = [o["humidity"] for o in obs]
     winds   = [o["wind_speed"] for o in obs if o["wind_speed"] is not None]
     solars  = [o["solar_radiation"] for o in obs if o["solar_radiation"] is not None]
+    dews    = [o["dew_point"] for o in obs if o.get("dew_point") is not None]
 
     T_mean = sum(temps) / len(temps)
     T_max  = max(temps)
@@ -61,9 +62,17 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     # Psychrometric constant γ (kPa/°C) (FAO-56 eq. 8)
     gamma = 0.000665 * P
 
-    # Saturation and actual vapour pressures (kPa) (FAO-56 eq. 11–17)
+    # Saturation vapour pressure (kPa) (FAO-56 eq. 11-12)
     es = (_sat_vp(T_max) + _sat_vp(T_min)) / 2
-    ea = _sat_vp(T_mean) * RH_mean / 100
+
+    # Actual vapour pressure (kPa): prefer the station's directly-measured
+    # dew point (ASCE (2005) eq. 8) over the RH*es(T_mean) approximation -
+    # a measurement beats a derivation from two other measurements.
+    if dews:
+        T_dew_mean = sum(dews) / len(dews)
+        ea = _sat_vp(T_dew_mean)
+    else:
+        ea = _sat_vp(T_mean) * RH_mean / 100
 
     # Slope of saturation vapour pressure curve Δ (kPa/°C) (FAO-56 eq. 13)
     delta = 4098 * _sat_vp(T_mean) / (T_mean + 237.3) ** 2

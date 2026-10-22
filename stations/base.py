@@ -15,6 +15,7 @@ class Observation(TypedDict):
     wind_speed:      float | None  # wind average (m/s)
     solar_radiation: float | None  # global solar radiation (W/m²)
     pressure:        float | None  # station pressure (hPa)
+    dew_point:       float | None  # dew point (°C), when the station reports it directly
 
 
 class WeatherStationListener(ABC):
@@ -39,6 +40,13 @@ class WeatherStationListener(ABC):
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self.last_seen: float | None = None
+        # Drivers whose backing API reports the station's own registered
+        # location (e.g. PWSWeather/Xweather) fill these in once learned, so
+        # ETP uses the real station coordinates instead of the LATITUDE/
+        # ELEVATION env vars, which are a single value shared across every
+        # configured station and easy to leave at a wrong/default value.
+        self.latitude: float | None = None
+        self.elevation: float | None = None
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"{self.name}-listener")

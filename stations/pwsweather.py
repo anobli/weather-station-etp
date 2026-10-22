@@ -96,11 +96,23 @@ class PWSWeatherListener(WeatherStationListener):
             logger.error("PWSWeather API error: %s", payload.get("error"))
             return
 
-        ob = (payload.get("response") or {}).get("ob") or {}
+        response = payload.get("response") or {}
+        ob = response.get("ob") or {}
         timestamp = ob.get("timestamp")
         if timestamp is None or timestamp == self._last_timestamp:
             return  # nothing new since the last poll
         self._last_timestamp = timestamp
+
+        if self.latitude is None or self.elevation is None:
+            loc = response.get("loc") or {}
+            profile = response.get("profile") or {}
+            lat, elev = loc.get("lat"), profile.get("elevM")
+            if lat is not None and elev is not None:
+                self.latitude, self.elevation = lat, elev
+                logger.info(
+                    "PWSWeather station %s registered at lat=%s elevation=%sm (overrides LATITUDE/ELEVATION env)",
+                    self.station_id, lat, elev,
+                )
 
         record: Observation = {
             "timestamp":       int(timestamp),
@@ -109,5 +121,6 @@ class PWSWeatherListener(WeatherStationListener):
             "wind_speed":      ob.get("windSpeedMPS"),
             "solar_radiation": ob.get("solradWM2"),
             "pressure":        ob.get("spressureMB", ob.get("pressureMB")),
+            "dew_point":       ob.get("dewpointC"),
         }
         self.publish(record)
