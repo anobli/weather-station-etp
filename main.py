@@ -96,6 +96,7 @@ stations: dict[str, WeatherStationListener] = {
 }
 for st in stations.values():
     st.default_latitude, st.default_elevation, st.anemometer_height = LATITUDE, ELEVATION, ANEMOMETER_HEIGHT
+    st.observation_retention_hours = OBSERVATION_RETENTION_HOURS
 sched = BackgroundScheduler()
 
 

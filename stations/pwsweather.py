@@ -99,6 +99,12 @@ class PWSWeatherListener(WeatherStationListener):
                     self.station_id, len(gap_days), gap_days[0], gap_days[-1],
                 )
                 self.backfill(gap_days)
+                # Backfilled days older than retention would otherwise sit
+                # in the raw table until the next scheduled archive run;
+                # fold them into the hourly archive right away.
+                archived = self.db.archive_old_observations(keep_hours=self.observation_retention_hours)
+                if archived:
+                    logger.info("%s: folded %d backfilled day(s) into the hourly archive", self.station_id, archived)
 
         logger.info("Polling PWSWeather station %s every %ds", self.station_id, self.poll_seconds)
         while not self._stop.is_set():

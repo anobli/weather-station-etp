@@ -61,6 +61,11 @@ class WeatherStationListener(ABC):
         self.default_latitude: float = 48.8566
         self.default_elevation: float = 100.0
         self.anemometer_height: float = 2.0
+        # Mirrors main.py's OBSERVATION_RETENTION_HOURS, so a driver that
+        # backfills old data (past retention) can immediately fold it into
+        # the hourly archive itself, instead of leaving it in the raw table
+        # until the next scheduled archive run.
+        self.observation_retention_hours: int = 8760
 
     def start(self):
         self._thread = threading.Thread(target=self._run, daemon=True, name=f"{self.name}-listener")
