@@ -63,6 +63,18 @@ class Database:
                     et0_alt_mm      TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_etp_ts ON etp_results(computed_at);
+
+                -- Comparison-only: Météo France ETPgrille, for the grid
+                -- point nearest this station (see meteofrance.py). One row
+                -- per calendar day; grid_lon/grid_lat repeated on every row
+                -- rather than kept elsewhere, so this table alone is
+                -- self-describing.
+                CREATE TABLE IF NOT EXISTS meteofrance_etp (
+                    date     TEXT PRIMARY KEY,
+                    grid_lon REAL NOT NULL,
+                    grid_lat REAL NOT NULL,
+                    etp_mm   REAL NOT NULL
+                );
             """)
             # Migration for DBs created before et0_alt_mm existed.
             columns = {row["name"] for row in c.execute("PRAGMA table_info(etp_results)")}
@@ -156,6 +168,27 @@ class Database:
         with self._conn() as c:
             rows = c.execute(query, params).fetchall()
         return [self._decode_etp(dict(r)) for r in rows]
+
+    def upsert_meteofrance_etp(self, grid_point: tuple[float, float], series: dict[date, float]):
+        glon, glat = grid_point
+        with self._conn() as c:
+            c.executemany(
+                "INSERT OR REPLACE INTO meteofrance_etp (date, grid_lon, grid_lat, etp_mm) VALUES (?, ?, ?, ?)",
+                [(d.isoformat(), glon, glat, etp) for d, etp in series.items()],
+            )
+
+    def get_meteofrance_etp(self, start_day: date, end_day: date) -> dict[date, float]:
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT date, etp_mm FROM meteofrance_etp WHERE date >= ? AND date <= ?",
+                (start_day.isoformat(), end_day.isoformat()),
+            ).fetchall()
+        return {date.fromisoformat(r["date"]): r["etp_mm"] for r in rows}
+
+    def get_meteofrance_grid_point(self) -> tuple[float, float] | None:
+        with self._conn() as c:
+            row = c.execute("SELECT grid_lon, grid_lat FROM meteofrance_etp LIMIT 1").fetchone()
+        return (row["grid_lon"], row["grid_lat"]) if row else None
 
     def get_range(self, start_ts: int, end_ts: int) -> list[dict]:
         with self._conn() as c:

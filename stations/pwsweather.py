@@ -131,12 +131,12 @@ class PWSWeatherListener(WeatherStationListener):
             return
         loc = response.get("loc") or {}
         profile = response.get("profile") or {}
-        lat, elev = loc.get("lat"), profile.get("elevM")
+        lat, lon, elev = loc.get("lat"), loc.get("long"), profile.get("elevM")
         if lat is not None and elev is not None:
-            self.latitude, self.elevation = lat, elev
+            self.latitude, self.longitude, self.elevation = lat, lon, elev
             logger.info(
-                "PWSWeather station %s registered at lat=%s elevation=%sm (overrides LATITUDE/ELEVATION env)",
-                self.station_id, lat, elev,
+                "PWSWeather station %s registered at lat=%s lon=%s elevation=%sm (overrides LATITUDE/LONGITUDE/ELEVATION env)",
+                self.station_id, lat, lon, elev,
             )
 
     def _poll(self):

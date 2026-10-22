@@ -53,12 +53,18 @@ class WeatherStationListener(ABC):
         # configured station and easy to leave at a wrong/default value.
         self.latitude: float | None = None
         self.elevation: float | None = None
+        # Longitude isn't needed by the FAO-56 ET0 formula itself (daily Ra
+        # only depends on latitude + day-of-year), so it's not part of
+        # Observation/publish() - it only exists for looking up the nearest
+        # Météo France ETPgrille comparison point (meteofrance.py).
+        self.longitude: float | None = None
         # Fallback location/instrument config for drivers that never learn
         # their own from an API (Tempest, Ecowitt) - main.py overwrites
-        # these from the LATITUDE/ELEVATION/ANEMOMETER_HEIGHT env vars right
-        # after construction. publish() stamps every row with whichever of
-        # latitude/elevation/anemometer_height is in effect.
+        # these from the LATITUDE/LONGITUDE/ELEVATION/ANEMOMETER_HEIGHT env
+        # vars right after construction. publish() stamps every row with
+        # whichever of latitude/elevation/anemometer_height is in effect.
         self.default_latitude: float = 48.8566
+        self.default_longitude: float = 2.3522
         self.default_elevation: float = 100.0
         self.anemometer_height: float = 2.0
         # Mirrors main.py's OBSERVATION_RETENTION_HOURS, so a driver that

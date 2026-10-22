@@ -13,9 +13,18 @@ services:
     environment:
       # --- Location settings (required for accurate ETP) ---
       LATITUDE: ${LATITUDE:-48.8566}       # decimal degrees, positive = North
+      LONGITUDE: ${LONGITUDE:-2.3522}       # decimal degrees, positive = East
+      # LONGITUDE isn't used by the ET0 formula itself (only latitude +
+      # elevation are) - it's only used to look up the nearest Météo France
+      # ETPgrille comparison point below.
       ELEVATION: ${ELEVATION:-100}          # metres above sea level
       # Height of the station anemometer above ground (metres)
       ANEMOMETER_HEIGHT: ${ANEMOMETER_HEIGHT:-2.0}
+      # Comparison-only: daily ET0 from Météo France's ETPgrille (interpolated
+      # 0.125° model grid, not derived from this station's own data - expect
+      # it to diverge more in areas with strong local relief/microclimate).
+      # Set to 0 to disable.
+      METEOFRANCE_ENABLED: ${METEOFRANCE_ENABLED:-1}
       HTTP_PORT: ${HTTP_PORT:-8080}
       # IANA timezone for CSV export day boundaries, e.g. Europe/Paris
       TIMEZONE: ${TIMEZONE:-Europe/Paris}

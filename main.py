@@ -10,6 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import export
+import meteofrance
 from calculator import compute_etp
 from database import Database
 from stations import WeatherStationListener, create_listener
@@ -24,8 +25,11 @@ GIT_SHA = os.environ.get("GIT_SHA", "unknown")
 logger.info("Starting weather-station-etp, commit=%s", GIT_SHA)
 
 LATITUDE          = float(os.environ.get("LATITUDE", "48.8566"))
+LONGITUDE         = float(os.environ.get("LONGITUDE", "2.3522"))
 ELEVATION         = float(os.environ.get("ELEVATION", "100"))
 ANEMOMETER_HEIGHT = float(os.environ.get("ANEMOMETER_HEIGHT", "2.0"))
+# Météo France ETPgrille comparison (see meteofrance.py); 0 disables it.
+METEOFRANCE_ENABLED = os.environ.get("METEOFRANCE_ENABLED", "1") not in ("0", "false", "False")
 DATA_DIR          = os.environ.get("DATA_DIR", "/data")
 # How long raw per-minute observations are kept at full resolution before
 # being downsampled into hourly min/max/mean buckets (kept indefinitely —
@@ -96,6 +100,7 @@ stations: dict[str, WeatherStationListener] = {
 }
 for st in stations.values():
     st.default_latitude, st.default_elevation, st.anemometer_height = LATITUDE, ELEVATION, ANEMOMETER_HEIGHT
+    st.default_longitude = LONGITUDE
     st.observation_retention_hours = OBSERVATION_RETENTION_HOURS
 sched = BackgroundScheduler()
 
@@ -133,6 +138,28 @@ def run_archive():
             logger.info("[%s] Archived %d hourly bucket(s) of raw observations", name, written)
 
 
+def run_meteofrance_refresh():
+    """Comparison-only: refresh each station's nearest Météo France
+    ETPgrille grid point for the current year (and, in January, the tail
+    of last year too, since that grid point's file for the new year won't
+    have it yet). Runs on a schedule, not inline with the hourly ETP
+    computation, since it's a ~4 MB network fetch."""
+    if not METEOFRANCE_ENABLED:
+        return
+    today = date.today()
+    years = [today.year] if today.month > 1 else [today.year - 1, today.year]
+    for name, st in stations.items():
+        lat = st.latitude if st.latitude is not None else st.default_latitude
+        lon = st.longitude if st.longitude is not None else st.default_longitude
+        for year in years:
+            try:
+                grid_point, series = meteofrance.fetch_year(lat, lon, year)
+                st.db.upsert_meteofrance_etp(grid_point, series)
+                logger.info("[%s] Météo France grid %s: %d day(s) for %d", name, grid_point, len(series), year)
+            except Exception:
+                logger.exception("[%s] Météo France refresh failed for %d", name, year)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for st in stations.values():
@@ -140,6 +167,13 @@ async def lifespan(app: FastAPI):
         st.start()
     sched.add_job(run_etp,     "cron", minute=0)       # top of every hour
     sched.add_job(run_archive, "cron", hour=3, minute=0)  # daily downsample + purge
+    # Météo France typically publishes the updated current-year file around
+    # 08:00 UTC (observed, not documented - may drift); run a couple hours
+    # after that rather than at run_archive's hour=3 so this actually picks
+    # up the freshest day instead of running a stale fetch and waiting
+    # another 24h for it.
+    sched.add_job(run_meteofrance_refresh, "cron", hour=10, minute=0)
+    sched.add_job(run_meteofrance_refresh, "date", run_date=datetime.now())  # once, in the background
     sched.start()
     run_etp()   # immediate first computation on startup
     yield
@@ -182,6 +216,7 @@ def health(station: str | None = None):
         "location_source": "station" if st.latitude is not None else "env",
         "anemometer_height_m": ANEMOMETER_HEIGHT,
         "observation_retention_days": round(OBSERVATION_RETENTION_HOURS / 24, 1),
+        "meteofrance_grid_point": st.db.get_meteofrance_grid_point(),
     }
 
 
@@ -247,6 +282,14 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
         if day not in best or dist < best[day][0]:
             best[day] = (dist, r)
 
+    # Comparison-only (see meteofrance.py) - not computed from this
+    # station's own data, so it's simply missing (None) for any day the
+    # grid refresh hasn't reached yet (not yet published, or refresh failed).
+    mf_days = sorted(best)
+    meteofrance_etp = (
+        _station(station).db.get_meteofrance_etp(mf_days[0], mf_days[-1]) if mf_days else {}
+    )
+
     return {
         "days": [
             {
@@ -255,6 +298,7 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
                 "et0_alt_mm":          r["et0_alt_mm"],
                 "observation_count":   r["observation_count"],
                 "midnight_offset_min": round(dist / 60, 1),
+                "meteofrance_etp_mm":  meteofrance_etp.get(day),
             }
             for day, (dist, r) in sorted(best.items())
         ]
@@ -549,6 +593,7 @@ const methodLabel = {
   priestley_taylor:  'Priestley-Taylor',
   makkink:           'Makkink',
   turc:              'Turc',
+  meteofrance:       'Météo France (grid, comparison only)',
 };
 const methodColor = {
   penman_monteith:   '#7dd3fc',
@@ -556,6 +601,7 @@ const methodColor = {
   priestley_taylor:  '#34d399',
   makkink:           '#fbbf24',
   turc:              '#c084fc',
+  meteofrance:       '#f472b6',
 };
 
 let lastDailyDays = [];
@@ -811,6 +857,9 @@ function drawDailyChart(days) {
   days.forEach((d, i) => {
     for (const [method, value] of Object.entries(d.et0_alt_mm)) {
       (series[method] ??= Array(days.length).fill(null))[i] = value;
+    }
+    if (d.meteofrance_etp_mm != null) {
+      (series.meteofrance ??= Array(days.length).fill(null))[i] = d.meteofrance_etp_mm;
     }
   });
 
