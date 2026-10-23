@@ -243,7 +243,6 @@ def current_etp(station: str | None = None):
     if not r:
         return JSONResponse(status_code=503, content={"error": "No ETP data yet"})
     return {
-        "computed_at":      _iso(r["computed_at"]),
         "window_start":     _iso(r["window_start"]),
         "window_end":       _iso(r["window_end"]),
         "et0_mm_per_day":   r["et0_mm"],
@@ -258,7 +257,8 @@ def etp_history(limit: int = 48, station: str | None = None):
     return {
         "entries": [
             {
-                "computed_at":      _iso(r["computed_at"]),
+                "window_start":     _iso(r["window_start"]),
+                "window_end":       _iso(r["window_end"]),
                 "et0_mm_per_day":   r["et0_mm"],
                 "et0_alt_mm_per_day": r["et0_alt_mm"],
                 "observation_count": r["observation_count"],
@@ -486,7 +486,7 @@ _HTML = """<!DOCTYPE html>
   <div id="view-overview">
   <div class="grid">
     <div class="card">
-      <div class="lbl">ETP — rolling 24 h</div>
+      <div class="lbl">ETP</div>
       <div class="val" id="etp">—<span class="unit">mm/day</span></div>
       <div class="sub" id="etp-sub">awaiting data…</div>
     </div>
@@ -521,9 +521,9 @@ _HTML = """<!DOCTYPE html>
     <tbody id="methods"><tr><td colspan="3" style="color:#64748b">loading…</td></tr></tbody>
   </table>
 
-  <h2>ETP History — last 48 computations</h2>
+  <h2>ETP History — last 48 entries</h2>
   <table>
-    <thead><tr><th>Computed at (UTC)</th><th>ETP mm/day</th><th>Observations</th></tr></thead>
+    <thead><tr><th>Period</th><th>ETP mm/day</th><th>Observations</th></tr></thead>
     <tbody id="hist"><tr><td colspan="3" style="color:#64748b">loading…</td></tr></tbody>
   </table>
 
@@ -594,6 +594,18 @@ _HTML = """<!DOCTYPE html>
 <script>
 const fmt = v => v != null ? v : '—';
 const fmtDt = iso => iso ? new Date(iso).toLocaleString() : '—';
+// What period an ETP value is actually about (window_start..window_end) -
+// a single date for a value that spans one calendar day (daily-summary-
+// refined PWSWeather, Météo France, or a Tempest/Ecowitt row that happens
+// to land on midnight), a date range otherwise (a live rolling-24h window
+// that hasn't landed on midnight yet).
+const periodLabel = (startIso, endIso) => {
+  if (!startIso || !endIso) return '—';
+  const start = new Date(startIso), end = new Date(endIso);
+  const days = (end - start) / 86400000;
+  const d = x => x.toLocaleDateString();
+  return days <= 1.1 ? d(start) : `${d(start)} – ${d(end)}`;
+};
 
 const methodLabel = {
   penman_monteith:   'Penman-Monteith',
@@ -789,7 +801,7 @@ async function refresh() {
     document.getElementById('etp').innerHTML =
       `${etp.et0_mm_per_day.toFixed(2)}<span class="unit">mm/day</span>`;
     document.getElementById('etp-sub').textContent =
-      `Computed: ${fmtDt(etp.computed_at)}`;
+      `For: ${periodLabel(etp.window_start, etp.window_end)}`;
 
     const rows = [['Penman-Monteith (reference)', etp.et0_mm_per_day, 0]];
     for (const [key, val] of Object.entries(etp.et0_alt_mm_per_day || {})) {
@@ -831,7 +843,7 @@ async function refresh() {
     ? '<tr><td colspan="3" style="color:#64748b">no history yet</td></tr>'
     : hist.entries.map(e =>
         `<tr>
-          <td>${fmtDt(e.computed_at)}</td>
+          <td>${periodLabel(e.window_start, e.window_end)}</td>
           <td>${e.et0_mm_per_day.toFixed(3)}</td>
           <td>${fmt(e.observation_count)}</td>
         </tr>`

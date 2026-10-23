@@ -33,10 +33,15 @@ class WeatherStationListener(ABC):
     """
 
     name: str = "station"
-    # False for a driver that publishes ET0 it didn't compute itself
-    # (stations/meteofrance.py republishes an externally-published value
-    # directly into etp_results) - main.py's hourly compute_etp pass skips
-    # these, since they have no raw observations to compute anything from.
+    # False for a driver whose ETP shouldn't come from main.py's hourly
+    # rolling-24h-from-raw-observations pass (run_etp/calculator.compute_etp):
+    # either it republishes an externally-published value directly
+    # (stations/meteofrance.py - no raw observations to compute anything
+    # from), or it has its own, better per-day source and would rather
+    # have ETP only reflect a complete calendar day than an always-live
+    # but less accurate rolling estimate (stations/pwsweather.py, refined
+    # from Xweather's own daily summary - see main.py's
+    # run_pwsweather_summary_refresh).
     computes_own_etp: bool = True
     # Seconds since the last observation after which a station is considered
     # disconnected; override for drivers that poll on a longer interval.

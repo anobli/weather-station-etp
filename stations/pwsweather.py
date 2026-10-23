@@ -57,6 +57,15 @@ class PWSWeatherListener(WeatherStationListener):
     """
 
     name = "pwsweather"
+    # ETP comes from Xweather's own daily summary (run_pwsweather_summary_
+    # refresh), not main.py's generic hourly rolling-24h-from-raw-
+    # observations pass - a trailing window built from samples polled
+    # every PWSWEATHER_POLL_SECONDS is both less accurate than Xweather's
+    # full-resolution QC'd aggregate and confusing to show alongside it
+    # (two different "ETP" numbers with different meanings for the same
+    # station). Raw observations are still polled/stored for the live
+    # current-conditions cards and CSV export - just not used for ETP.
+    computes_own_etp = False
 
     def __init__(self, db, station_id: str | None = None, client_id: str | None = None,
                  client_secret: str | None = None, poll_seconds: int | None = None,
