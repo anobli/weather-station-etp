@@ -571,6 +571,7 @@ _HTML = """<!DOCTYPE html>
     .chip { background:#1e293b; border-radius:.6rem; padding:.85rem 1rem; flex:1; min-width:120px; text-align:center; }
     .chip-icon { font-size:1.3rem; display:block; }
     .chip-val  { font-size:1.05rem; font-weight:700; display:block; margin-top:.3rem; }
+    .chip-sub  { font-size:.65rem; color:#64748b; display:block; margin-top:.1rem; }
     .chip-lbl  { font-size:.65rem; color:#94a3b8; text-transform:uppercase; letter-spacing:.05em; }
     #today-chart, #intraday-chart { width:100%; }
 
@@ -610,8 +611,9 @@ _HTML = """<!DOCTYPE html>
         <div class="today-et0" id="today-et0">—<span class="unit">mm/day</span></div>
         <div class="today-chips" id="today-chips">
           <div class="chip"><span class="chip-icon">☀️</span><span class="chip-val" id="chip-solar">—</span><span class="chip-lbl">Solar</span></div>
-          <div class="chip"><span class="chip-icon">🌡️</span><span class="chip-val" id="chip-temp">—</span><span class="chip-lbl">Temp</span></div>
+          <div class="chip"><span class="chip-icon">🌡️</span><span class="chip-val" id="chip-temp">—</span><span class="chip-sub" id="chip-temp-range"></span><span class="chip-lbl">Temp</span></div>
           <div class="chip"><span class="chip-icon">💧</span><span class="chip-val" id="chip-hum">—</span><span class="chip-lbl">Humidity</span></div>
+          <div class="chip"><span class="chip-icon">💦</span><span class="chip-val" id="chip-dew">—</span><span class="chip-lbl">Dew Point</span></div>
           <div class="chip"><span class="chip-icon">🍃</span><span class="chip-val" id="chip-wind">—</span><span class="chip-lbl">Wind</span></div>
         </div>
       </div>
@@ -1063,7 +1065,10 @@ async function loadToday() {
   document.getElementById('chip-solar').textContent = agg.solar_radiation_mean != null
     ? `${(agg.solar_radiation_mean * 86400 / 1e6).toFixed(1)} MJ/m²/day` : '—';
   document.getElementById('chip-temp').textContent = agg.temperature_mean != null ? `${agg.temperature_mean.toFixed(1)} °C` : '—';
+  document.getElementById('chip-temp-range').textContent = (agg.temperature_min != null && agg.temperature_max != null)
+    ? `min ${agg.temperature_min.toFixed(1)} / max ${agg.temperature_max.toFixed(1)}` : '';
   document.getElementById('chip-hum').textContent = agg.humidity_mean != null ? `${agg.humidity_mean.toFixed(0)} %` : '—';
+  document.getElementById('chip-dew').textContent = agg.dew_point_mean != null ? `${agg.dew_point_mean.toFixed(1)} °C` : '—';
   document.getElementById('chip-wind').textContent = agg.wind_speed_mean != null ? `${agg.wind_speed_mean.toFixed(1)} m/s` : '—';
   lastTodayHours = intraday;
   drawTodayChart(intraday.hours, intraday.finalized);
@@ -1095,6 +1100,7 @@ async function loadIntraday() {
   const rows = [
     ['Temp min/max/mean', agg.temperature_min, agg.temperature_max, agg.temperature_mean, '°C', 1],
     ['RH min/max/mean', agg.humidity_min, agg.humidity_max, agg.humidity_mean, '%', 0],
+    ['Dew point mean', null, null, agg.dew_point_mean, '°C', 1],
     ['Wind mean', null, null, agg.wind_speed_mean, 'm/s', 1],
     ['Solar mean', null, null, agg.solar_radiation_mean, 'W/m²', 0],
   ];

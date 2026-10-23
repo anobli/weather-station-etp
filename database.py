@@ -264,7 +264,7 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
-    _AGGREGATE_DIMENSIONS = ("temperature", "humidity", "wind_speed", "solar_radiation", "pressure")
+    _AGGREGATE_DIMENSIONS = ("temperature", "humidity", "wind_speed", "solar_radiation", "pressure", "dew_point")
 
     def get_daily_aggregate(self, start_ts: int, end_ts: int) -> dict | None:
         """Min/max/mean per weather dimension over [start_ts, end_ts). Prefers
