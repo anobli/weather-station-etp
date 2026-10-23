@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import export
-from calculator import compute_etp, compute_etp_from_summary
+from calculator import compute_etp, compute_etp_from_summary, compute_etp_intraday
 from database import Database
 from stations import WeatherStationListener, create_listener
 
@@ -291,13 +291,7 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
     # number of hours). No cutoff: a missed tick, a restart-triggered
     # off-schedule run, or drift still gives the closest available estimate
     # for that day rather than silently dropping it.
-    best: dict[date, tuple[int, dict]] = {}
-    for r in rows:
-        day = datetime.fromtimestamp(r["window_end"], tz=TZ).date() - timedelta(days=1)
-        target = export.local_day_bounds(day, TZ)[1]
-        dist = abs(r["window_end"] - target)
-        if day not in best or dist < best[day][0]:
-            best[day] = (dist, r)
+    best = _etp_by_day(rows)
 
     return {
         "days": [
@@ -311,6 +305,87 @@ def etp_daily(station: str | None = None, start: date | None = None, end: date |
             for day, (dist, r) in sorted(best.items())
         ]
     }
+
+
+@app.get("/api/etp/intraday")
+def etp_intraday(date: date, station: str | None = None):
+    """Cumulative ET0 "through hour h" across the given local calendar day, by
+    method - the Research intraday chart and Today's accumulation curve both
+    use this (Today just ignores every method but Penman-Monteith). Backs
+    both a finalized past day (full curve, hour 1..24, ending exactly at that
+    day's stored et0_mm/et0_alt_mm) and today-in-progress (curve stops at the
+    current local hour, ending at the latest rolling-24h estimate). Only
+    produces points for stations with raw per-minute observations (Tempest,
+    Ecowitt) - a daily-summary-only station (Meteo France, PWSWeather) has no
+    finer-than-a-day data to build a same-day curve from, so `hours` comes
+    back empty, same as a day with no stored ET0 to distribute at all."""
+    st = _station(station)
+    today_local = datetime.now(TZ).date()
+    if date > today_local:
+        raise HTTPException(status_code=400, detail="date cannot be in the future")
+    day_start_ts, day_end_ts = export.local_day_bounds(date, TZ)
+    finalized = date < today_local
+    query_end_ts = day_end_ts if finalized else min(day_end_ts, int(time.time()))
+    max_hour = 24 if finalized else max(0, min(24, (query_end_ts - day_start_ts + 3599) // 3600))
+
+    if finalized:
+        rows = st.db.get_etp_range(day_start_ts - 3600, day_end_ts)
+        match = _etp_by_day(rows).get(date)
+        targets = match[1] if match else {}
+    else:
+        targets = st.db.get_latest_etp() or {}
+
+    obs = st.db.get_range(day_start_ts, query_end_ts)
+    hours = compute_etp_intraday(obs, day_start_ts, targets, max_hour)
+    return {"date": date.isoformat(), "finalized": finalized, "hours": hours}
+
+
+@app.get("/api/observations/daily-summary")
+def daily_summary(date: date, station: str | None = None):
+    """A single local calendar day's finalized weather aggregates (min/max/mean
+    per dimension) alongside its ET0 - feeds Today's number+chips and
+    Research's intraday numeric panel. `aggregates` is None if the station has
+    no raw or archived data at all for that day (e.g. it was offline, or - for
+    a daily-summary-only station - Xweather/Meteo France hasn't published yet)."""
+    st = _station(station)
+    today_local = datetime.now(TZ).date()
+    if date > today_local:
+        raise HTTPException(status_code=400, detail="date cannot be in the future")
+    start_ts, end_ts = export.local_day_bounds(date, TZ)
+    aggregates = st.db.get_daily_aggregate(start_ts, end_ts)
+
+    # Narrow window around this one day is enough for _etp_by_day to find its
+    # match (window_end normally lands exactly on end_ts) without scanning the
+    # station's whole etp_results history - padded an hour on each side so a
+    # missed tick or a late/off-schedule run (window_end short of, or just
+    # past, local midnight) is still found, same tolerance etp_daily gets
+    # from scanning its whole requested range.
+    rows = st.db.get_etp_range(start_ts - 3600, end_ts + 3600)
+    match = _etp_by_day(rows).get(date)
+    et0_mm = match[1]["et0_mm"] if match else None
+
+    return {
+        "date": date.isoformat(),
+        "finalized": date < today_local,
+        "et0_mm": et0_mm,
+        "aggregates": aggregates,
+    }
+
+
+def _etp_by_day(rows: list[dict]) -> dict[date, tuple[int, dict]]:
+    """Pick whichever computation's window_end lands closest to local midnight
+    for each calendar day its window_end belongs to (window_end's own day,
+    minus the day it represents - see etp_daily's docstring). Returns
+    {day: (dist_seconds, row)} so callers can also inspect how close the match
+    was."""
+    best: dict[date, tuple[int, dict]] = {}
+    for r in rows:
+        day = datetime.fromtimestamp(r["window_end"], tz=TZ).date() - timedelta(days=1)
+        target = export.local_day_bounds(day, TZ)[1]
+        dist = abs(r["window_end"] - target)
+        if day not in best or dist < best[day][0]:
+            best[day] = (dist, r)
+    return best
 
 
 def _parse_date_range(start: date, end: date) -> tuple[int, int]:
@@ -472,18 +547,90 @@ _HTML = """<!DOCTYPE html>
     .tab  { padding:.45rem 1rem; border-radius:.4rem; border:none; background:#1e293b; color:#94a3b8;
             font-weight:600; cursor:pointer; text-transform:capitalize; }
     .tab.active { background:#7dd3fc; color:#0f172a; }
+
+    .section-nav { display:flex; gap:.5rem; margin-bottom:1.5rem; }
+    .section-btn { flex:1; padding:.7rem 1rem; border:none; border-radius:.5rem; background:#1e293b;
+                   color:#94a3b8; font-weight:700; font-size:.95rem; cursor:pointer; }
+    .section-btn.active { background:#7dd3fc; color:#0f172a; }
+
+    .day-stepper { display:flex; align-items:center; justify-content:center; gap:1rem; margin-bottom:1.25rem; }
+    .step-btn { width:48px; height:48px; border-radius:50%; border:none; background:#1e293b; color:#7dd3fc;
+                font-size:1.4rem; cursor:pointer; }
+    .step-btn:disabled { opacity:.35; cursor:default; }
+    .day-label { font-size:1rem; font-weight:600; min-width:10rem; text-align:center; }
+
+    .badge-inprogress { display:block; width:fit-content; margin:0 auto 1.25rem; background:#334155;
+                         color:#fbbf24; font-size:.75rem; font-weight:600; padding:.4rem .9rem;
+                         border-radius:999px; text-align:center; }
+    .state-msg { text-align:center; color:#64748b; padding:2.5rem 0; }
+    .state-msg button { margin-left:.6rem; }
+
+    .today-main { display:flex; flex-direction:column; gap:1.5rem; }
+    .today-et0  { font-size:3rem; font-weight:800; }
+    .today-chips { display:flex; gap:.75rem; flex-wrap:wrap; margin-top:1.25rem; }
+    .chip { background:#1e293b; border-radius:.6rem; padding:.85rem 1rem; flex:1; min-width:120px; text-align:center; }
+    .chip-icon { font-size:1.3rem; display:block; }
+    .chip-val  { font-size:1.05rem; font-weight:700; display:block; margin-top:.3rem; }
+    .chip-lbl  { font-size:.65rem; color:#94a3b8; text-transform:uppercase; letter-spacing:.05em; }
+    #today-chart, #intraday-chart { width:100%; }
+
+    @media (max-width: 767px) {
+      body { padding-bottom: 5.5rem; }
+      .section-nav { position:fixed; left:0; right:0; bottom:0; margin:0; z-index:50;
+                      padding:.6rem 1rem calc(.6rem + env(safe-area-inset-bottom));
+                      background:#1e293b; box-shadow:0 -2px 10px rgba(0,0,0,.4); }
+      .section-btn { padding:.9rem .5rem; border-radius:.6rem; min-height:48px; }
+    }
+    @media (min-width: 768px) {
+      .today-main { flex-direction:row; align-items:flex-start; }
+      .today-left { flex:1; max-width:320px; }
+      .today-right { flex:2; }
+    }
   </style>
 </head>
 <body>
   <h1>Weather Station ETP Monitor</h1>
+  <nav class="section-nav" id="section-nav">
+    <button class="section-btn" data-section="today">Today</button>
+    <button class="section-btn" data-section="research">Research</button>
+  </nav>
+
+  <section id="section-today">
+    <div class="day-stepper" id="today-stepper">
+      <button class="step-btn" id="today-prev" aria-label="Previous day">‹</button>
+      <div class="day-label" id="today-label">—</div>
+      <button class="step-btn" id="today-next" aria-label="Next day">›</button>
+    </div>
+    <div class="badge-inprogress" id="today-badge" hidden>Still building up — check back after midnight</div>
+    <div class="state-msg" id="today-loading" hidden>Loading…</div>
+    <div class="state-msg" id="today-empty" hidden>No data for this day</div>
+    <div class="state-msg" id="today-error" hidden>Couldn't load data for this day. <button class="tab" id="today-retry">Retry</button></div>
+    <div class="today-main" id="today-content" hidden>
+      <div class="today-left">
+        <div class="today-et0" id="today-et0">—<span class="unit">mm/day</span></div>
+        <div class="today-chips" id="today-chips">
+          <div class="chip"><span class="chip-icon">☀️</span><span class="chip-val" id="chip-solar">—</span><span class="chip-lbl">Solar</span></div>
+          <div class="chip"><span class="chip-icon">🌡️</span><span class="chip-val" id="chip-temp">—</span><span class="chip-lbl">Temp</span></div>
+          <div class="chip"><span class="chip-icon">💧</span><span class="chip-val" id="chip-hum">—</span><span class="chip-lbl">Humidity</span></div>
+          <div class="chip"><span class="chip-icon">🍃</span><span class="chip-val" id="chip-wind">—</span><span class="chip-lbl">Wind</span></div>
+        </div>
+      </div>
+      <div class="today-right">
+        <canvas id="today-chart" height="240"></canvas>
+      </div>
+    </div>
+  </section>
+
+  <section id="section-research" hidden>
   <nav class="tabs" id="tabs" hidden></nav>
-  <nav class="tabs" id="view-tabs">
-    <button class="tab active" data-view="overview">Overview</button>
-    <button class="tab" data-view="chart">Daily ETP Chart</button>
+  <nav class="tabs" id="research-tabs">
+    <button class="tab active" data-view="monitor">Monitor</button>
+    <button class="tab" data-view="daily">Daily ETP Chart</button>
+    <button class="tab" data-view="intraday">Intraday</button>
     <button class="tab" data-view="browse">Browse Data</button>
   </nav>
 
-  <div id="view-overview">
+  <div id="view-monitor">
   <div class="grid">
     <div class="card">
       <div class="lbl">ETP</div>
@@ -543,9 +690,18 @@ _HTML = """<!DOCTYPE html>
     </form>
     <div class="sub" style="margin-top:.5rem">Raw covers the last ~<span id="retention-days">?</span> days; archive holds downsampled hourly min/max/mean for everything older.</div>
   </div>
+
+  <h2 style="margin-top:2rem">Settings</h2>
+  <div class="card">
+    <label style="display:flex;align-items:center;gap:.5rem;font-size:.85rem;color:#94a3b8;cursor:pointer">
+      <input type="checkbox" id="pin-today-toggle">
+      Always open on Today
+    </label>
+    <div class="sub" style="margin-top:.4rem">Mainly for farmer-facing installs — skips remembering the last section visited and always lands on Today.</div>
+  </div>
   </div>
 
-  <div id="view-chart" hidden>
+  <div id="view-daily" hidden>
   <h2>Daily ETP by Method</h2>
   <div class="card" style="margin-bottom:2rem">
     <form id="daily-range" style="display:flex;gap:.75rem;align-items:flex-end;flex-wrap:wrap;margin-bottom:1rem">
@@ -558,9 +714,33 @@ _HTML = """<!DOCTYPE html>
       <button type="submit" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#7dd3fc;color:#0f172a;font-weight:600;cursor:pointer">Apply</button>
       <button type="button" id="daily-range-clear" style="padding:.45rem 1rem;border-radius:.4rem;border:none;background:#334155;color:#e2e8f0;cursor:pointer">Full history</button>
     </form>
+    <div class="tabs" id="daily-mode" style="margin-bottom:.75rem">
+      <button type="button" class="tab active" data-mode="absolute">Absolute values</button>
+      <button type="button" class="tab" data-mode="delta">Delta vs Penman-Monteith</button>
+    </div>
     <canvas id="daily-chart" height="260" style="width:100%;max-width:100%"></canvas>
     <div id="daily-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
     <div class="sub" style="margin-top:.5rem">Each point is the single rolling-24h computation whose window spans that calendar day, local midnight to midnight.</div>
+  </div>
+  </div>
+
+  <div id="view-intraday" hidden>
+  <h2>Intraday / Accumulation</h2>
+  <div class="day-stepper" id="intraday-stepper">
+    <button class="step-btn" id="intraday-prev" aria-label="Previous day">‹</button>
+    <div class="day-label" id="intraday-label">—</div>
+    <button class="step-btn" id="intraday-next" aria-label="Next day">›</button>
+  </div>
+  <div class="badge-inprogress" id="intraday-badge" hidden>Still building up — check back after midnight</div>
+  <div class="state-msg" id="intraday-loading" hidden>Loading…</div>
+  <div class="state-msg" id="intraday-empty" hidden>No intraday data for this station/day</div>
+  <div class="state-msg" id="intraday-error" hidden>Couldn't load data for this day. <button class="tab" id="intraday-retry">Retry</button></div>
+  <div id="intraday-content" hidden>
+    <div class="card" style="margin-bottom:1.5rem">
+      <canvas id="intraday-chart" height="280"></canvas>
+      <div id="intraday-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
+    </div>
+    <div class="grid" id="intraday-aggregates"></div>
   </div>
   </div>
 
@@ -590,6 +770,7 @@ _HTML = """<!DOCTYPE html>
     </div>
   </div>
   </div>
+  </section>
 
 <script>
 const fmt = v => v != null ? v : '—';
@@ -646,14 +827,21 @@ async function loadStations() {
   selectStation();
 }
 
-document.getElementById('view-tabs').onclick = e => {
+let researchView = 'monitor';
+document.getElementById('research-tabs').onclick = e => {
   const view = e.target.dataset.view;
   if (!view) return;
-  document.querySelectorAll('#view-tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
-  document.getElementById('view-overview').hidden = view !== 'overview';
-  document.getElementById('view-chart').hidden = view !== 'chart';
+  researchView = view;
+  document.querySelectorAll('#research-tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.view === view));
+  document.getElementById('view-monitor').hidden = view !== 'monitor';
+  document.getElementById('view-daily').hidden = view !== 'daily';
+  document.getElementById('view-intraday').hidden = view !== 'intraday';
   document.getElementById('view-browse').hidden = view !== 'browse';
-  if (view === 'chart') drawDailyChart(lastDailyDays);
+  if (view === 'daily') drawDailyChart(lastDailyDays);
+  if (view === 'intraday' && !intradayLoadedOnce) {
+    intradayLoadedOnce = true;
+    loadIntraday();
+  }
   if (view === 'browse' && !browseLoadedOnce) {
     browseLoadedOnce = true;
     const end = new Date();
@@ -662,6 +850,292 @@ document.getElementById('view-tabs').onclick = e => {
     document.querySelector('#browse-range [name=end]').value = end.toISOString().slice(0, 10);
     loadBrowse();
   }
+};
+
+// --- Today/Research top-level section switch, day-stepper, and the
+// generalized chart renderer shared by the daily chart, Today's single-line
+// accumulation curve, and Research's 5-line intraday curve. ---
+
+const SECTION_KEY = 'navSection', PIN_KEY = 'pinToToday';
+let section = 'today';
+
+function todayStr() {
+  const d = new Date();
+  return new Date(d.getTime() - d.getTimezoneOffset() * 60000).toISOString().slice(0, 10);
+}
+function addDays(dateStr, delta) {
+  const d = new Date(dateStr + 'T12:00:00');
+  d.setDate(d.getDate() + delta);
+  return d.toISOString().slice(0, 10);
+}
+function fmtDayLabel(dateStr) {
+  const d = new Date(dateStr + 'T12:00:00');
+  const label = d.toLocaleDateString(undefined, { weekday: 'short', month: 'short', day: 'numeric' });
+  return dateStr === todayStr() ? `Today, ${label}` : label;
+}
+
+function makeDayStepper({ prevBtn, nextBtn, labelEl, initial, onChange }) {
+  let current = initial;
+  function render() {
+    labelEl.textContent = fmtDayLabel(current);
+    nextBtn.disabled = current >= todayStr();
+  }
+  function set(dateStr) {
+    current = dateStr;
+    render();
+    onChange(current);
+  }
+  prevBtn.onclick = () => set(addDays(current, -1));
+  nextBtn.onclick = () => { if (current < todayStr()) set(addDays(current, 1)); };
+  render();
+  return { get: () => current, set };
+}
+
+document.addEventListener('keydown', e => {
+  if (e.key !== 'ArrowLeft' && e.key !== 'ArrowRight') return;
+  if (['INPUT', 'TEXTAREA'].includes(document.activeElement?.tagName)) return;
+  const delta = e.key === 'ArrowLeft' ? -1 : 1;
+  if (section === 'today') {
+    if (delta > 0 && todayStepper.get() >= todayStr()) return;
+    todayStepper.set(addDays(todayStepper.get(), delta));
+  } else if (section === 'research' && researchView === 'intraday') {
+    if (delta > 0 && intradayStepper.get() >= todayStr()) return;
+    intradayStepper.set(addDays(intradayStepper.get(), delta));
+  }
+});
+
+function setState(prefix, state) {
+  for (const s of ['loading', 'empty', 'error', 'content']) {
+    const el = document.getElementById(`${prefix}-${s}`);
+    if (el) el.hidden = s !== state;
+  }
+}
+
+// Single canvas line-chart renderer shared by the daily chart (date x-axis,
+// absolute/delta), Today's accumulation curve (hour x-axis, single line, no
+// legend) and Research's intraday curve (hour x-axis, 5 lines, legend) -
+// replaces three near-identical bespoke drawing functions.
+function drawSeriesChart(canvas, legendEl, xLabels, series, opts = {}) {
+  const { showLegend = true, yFmt = v => v.toFixed(1), markPartial = false } = opts;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const W = canvas.clientWidth || 600;
+  const H = parseInt(canvas.getAttribute('height'), 10) || 260;
+  canvas.width = W * dpr;
+  canvas.height = H * dpr;
+  canvas.style.height = H + 'px';
+  ctx.scale(dpr, dpr);
+  ctx.clearRect(0, 0, W, H);
+  if (legendEl) legendEl.innerHTML = '';
+
+  const methods = opts.methods || Object.keys(series);
+  const allValues = methods.flatMap(m => series[m] || []).filter(v => v != null);
+  if (!xLabels.length || allValues.length === 0) {
+    ctx.fillStyle = '#64748b';
+    ctx.font = '13px system-ui';
+    ctx.fillText(opts.emptyText || 'No data yet.', 12, H / 2);
+    return;
+  }
+
+  const rawMin = Math.min(0, ...allValues);
+  const yMin = rawMin < 0 ? rawMin * 1.1 : 0;
+  const yMax = Math.max(...allValues, opts.yMin ?? 0.1) * 1.1;
+  const pad = { l: 40, r: 12, t: 10, b: 22 };
+  const plotW = W - pad.l - pad.r, plotH = H - pad.t - pad.b;
+  const xFor = i => pad.l + (xLabels.length === 1 ? plotW / 2 : (i / (xLabels.length - 1)) * plotW);
+  const yFor = v => pad.t + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+
+  ctx.strokeStyle = '#1e293b';
+  ctx.fillStyle = '#64748b';
+  ctx.font = '11px system-ui';
+  ctx.textAlign = 'right';
+  const steps = 4;
+  for (let i = 0; i <= steps; i++) {
+    const v = yMin + (yMax - yMin) / steps * i;
+    const y = yFor(v);
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+    ctx.fillText(yFmt(v), pad.l - 6, y + 3);
+  }
+  if (opts.zeroLine && yMin < 0) {
+    ctx.strokeStyle = '#94a3b8';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath(); ctx.moveTo(pad.l, yFor(0)); ctx.lineTo(W - pad.r, yFor(0)); ctx.stroke();
+  }
+
+  ctx.textAlign = 'center';
+  const tickIdx = xLabels.length === 1 ? [0] : [0, Math.floor((xLabels.length - 1) / 2), xLabels.length - 1];
+  tickIdx.forEach(i => ctx.fillText(xLabels[i], xFor(i), H - 4));
+
+  for (const method of methods) {
+    const values = series[method];
+    if (!values) continue;
+    const color = (opts.colorFor ? opts.colorFor(method) : methodColor[method]) || '#94a3b8';
+    let lastDefined = -1;
+    values.forEach((v, i) => { if (v != null) lastDefined = i; });
+
+    ctx.strokeStyle = color;
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    let started = false;
+    values.forEach((v, i) => {
+      if (v == null) { started = false; return; }
+      const x = xFor(i), y = yFor(v);
+      if (!started) { ctx.moveTo(x, y); started = true; return; }
+      if (markPartial && i === lastDefined) {
+        ctx.setLineDash([4, 4]);
+        ctx.lineTo(x, y);
+        ctx.stroke();
+        ctx.beginPath();
+        ctx.setLineDash([]);
+      } else {
+        ctx.lineTo(x, y);
+      }
+    });
+    ctx.stroke();
+
+    if (showLegend) {
+      const sw = document.createElement('span');
+      sw.innerHTML = `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;` +
+        `background:${color};margin-right:.4rem;vertical-align:middle"></span>${opts.labelFor ? opts.labelFor(method) : (methodLabel[method] || method)}`;
+      legendEl.appendChild(sw);
+    }
+  }
+}
+
+function hoursToSeries(hoursData) {
+  const series = { penman_monteith: hoursData.map(h => h.et0_mm) };
+  hoursData.forEach((h, i) => {
+    for (const [m, v] of Object.entries(h.et0_alt_mm || {})) {
+      (series[m] ??= Array(hoursData.length).fill(null))[i] = v;
+    }
+  });
+  return series;
+}
+
+function drawTodayChart(hoursData, finalized) {
+  const canvas = document.getElementById('today-chart');
+  const xLabels = hoursData.map(h => String(h.hour));
+  drawSeriesChart(canvas, null, xLabels, { penman_monteith: hoursData.map(h => h.et0_mm) }, {
+    showLegend: false, yMin: 0.1, markPartial: !finalized,
+    emptyText: 'No accumulation data for this day.',
+    methods: ['penman_monteith'],
+  });
+}
+
+function drawIntradayChart(hoursData, finalized) {
+  const canvas = document.getElementById('intraday-chart');
+  const legendEl = document.getElementById('intraday-legend');
+  const xLabels = hoursData.map(h => String(h.hour));
+  drawSeriesChart(canvas, legendEl, xLabels, hoursToSeries(hoursData), {
+    showLegend: true, yMin: 0.1, markPartial: !finalized,
+    emptyText: 'No intraday data for this station/day.',
+  });
+}
+
+let todayStepper, intradayStepper, intradayLoadedOnce = false;
+let lastTodayHours = { hours: [], finalized: true };
+let lastIntradayHours = { hours: [], finalized: true };
+
+async function loadToday() {
+  if (!station) return;
+  const dateStr = todayStepper.get();
+  setState('today', 'loading');
+  let summary, intraday;
+  try {
+    [summary, intraday] = await Promise.all([
+      fetch(q('/api/observations/daily-summary', `&date=${dateStr}`)).then(r => r.ok ? r.json() : Promise.reject()),
+      fetch(q('/api/etp/intraday', `&date=${dateStr}`)).then(r => r.ok ? r.json() : Promise.reject()),
+    ]);
+  } catch {
+    setState('today', 'error');
+    return;
+  }
+  if (summary.et0_mm == null && !summary.aggregates) {
+    setState('today', 'empty');
+    return;
+  }
+  setState('today', 'content');
+  document.getElementById('today-badge').hidden = dateStr !== todayStr();
+  document.getElementById('today-et0').innerHTML = summary.et0_mm != null
+    ? `${summary.et0_mm.toFixed(2)}<span class="unit">mm/day</span>`
+    : `—<span class="unit">mm/day</span>`;
+  const agg = summary.aggregates || {};
+  document.getElementById('chip-solar').textContent = agg.solar_radiation_mean != null
+    ? `${(agg.solar_radiation_mean * 86400 / 1e6).toFixed(1)} MJ/m²/day` : '—';
+  document.getElementById('chip-temp').textContent = agg.temperature_mean != null ? `${agg.temperature_mean.toFixed(1)} °C` : '—';
+  document.getElementById('chip-hum').textContent = agg.humidity_mean != null ? `${agg.humidity_mean.toFixed(0)} %` : '—';
+  document.getElementById('chip-wind').textContent = agg.wind_speed_mean != null ? `${agg.wind_speed_mean.toFixed(1)} m/s` : '—';
+  lastTodayHours = intraday;
+  drawTodayChart(intraday.hours, intraday.finalized);
+}
+
+async function loadIntraday() {
+  if (!station) return;
+  const dateStr = intradayStepper.get();
+  setState('intraday', 'loading');
+  let summary, intraday;
+  try {
+    [summary, intraday] = await Promise.all([
+      fetch(q('/api/observations/daily-summary', `&date=${dateStr}`)).then(r => r.ok ? r.json() : Promise.reject()),
+      fetch(q('/api/etp/intraday', `&date=${dateStr}`)).then(r => r.ok ? r.json() : Promise.reject()),
+    ]);
+  } catch {
+    setState('intraday', 'error');
+    return;
+  }
+  if (summary.et0_mm == null && !summary.aggregates) {
+    setState('intraday', 'empty');
+    return;
+  }
+  setState('intraday', 'content');
+  document.getElementById('intraday-badge').hidden = dateStr !== todayStr();
+  lastIntradayHours = intraday;
+  drawIntradayChart(intraday.hours, intraday.finalized);
+  const agg = summary.aggregates || {};
+  const rows = [
+    ['Temp min/max/mean', agg.temperature_min, agg.temperature_max, agg.temperature_mean, '°C', 1],
+    ['RH min/max/mean', agg.humidity_min, agg.humidity_max, agg.humidity_mean, '%', 0],
+    ['Wind mean', null, null, agg.wind_speed_mean, 'm/s', 1],
+    ['Solar mean', null, null, agg.solar_radiation_mean, 'W/m²', 0],
+  ];
+  document.getElementById('intraday-aggregates').innerHTML = rows.map(([label, min, max, mean, unit, dec]) => `
+    <div class="card">
+      <div class="lbl">${label}</div>
+      <div class="val" style="font-size:1.1rem">
+        ${min != null ? min.toFixed(dec) + ' / ' : ''}${max != null ? max.toFixed(dec) + ' / ' : ''}${mean != null ? mean.toFixed(dec) : '—'}<span class="unit">${unit}</span>
+      </div>
+    </div>`).join('');
+}
+
+document.getElementById('today-retry').onclick = loadToday;
+document.getElementById('intraday-retry').onclick = loadIntraday;
+
+function setSection(newSection, { persist = true } = {}) {
+  section = newSection;
+  document.querySelectorAll('.section-btn').forEach(b => b.classList.toggle('active', b.dataset.section === section));
+  document.getElementById('section-today').hidden = section !== 'today';
+  document.getElementById('section-research').hidden = section !== 'research';
+  if (persist) localStorage.setItem(SECTION_KEY, section);
+  if (section === 'today') loadToday();
+}
+
+document.getElementById('section-nav').onclick = e => {
+  const s = e.target.dataset.section;
+  if (!s) return;
+  setSection(s);
+};
+
+const pinToggle = document.getElementById('pin-today-toggle');
+pinToggle.checked = localStorage.getItem(PIN_KEY) === '1';
+pinToggle.onchange = () => localStorage.setItem(PIN_KEY, pinToggle.checked ? '1' : '0');
+
+let dailyMode = 'absolute';
+document.getElementById('daily-mode').onclick = e => {
+  const mode = e.target.dataset.mode;
+  if (!mode || mode === dailyMode) return;
+  dailyMode = mode;
+  document.querySelectorAll('#daily-mode .tab').forEach(t => t.classList.toggle('active', t.dataset.mode === mode));
+  drawDailyChart(lastDailyDays);
 };
 
 document.getElementById('daily-range').onsubmit = e => {
@@ -784,6 +1258,8 @@ function selectStation() {
   document.getElementById('methods').innerHTML = '<tr><td colspan="3" style="color:#64748b">loading…</td></tr>';
   loadDaily();
   if (browseLoadedOnce) loadBrowse();
+  if (intradayLoadedOnce) loadIntraday();
+  if (section === 'today') loadToday();
   refresh();
 }
 
@@ -853,79 +1329,49 @@ async function refresh() {
 function drawDailyChart(days) {
   const canvas = document.getElementById('daily-chart');
   const legendEl = document.getElementById('daily-legend');
-  const ctx = canvas.getContext('2d');
-  const dpr = window.devicePixelRatio || 1;
-  const W = canvas.clientWidth || 600;
-  const H = 260;
-  canvas.width = W * dpr;
-  canvas.height = H * dpr;
-  canvas.style.height = H + 'px';
-  ctx.scale(dpr, dpr);
-  ctx.clearRect(0, 0, W, H);
-  legendEl.innerHTML = '';
-
   if (!days.length) {
-    ctx.fillStyle = '#64748b';
-    ctx.font = '13px system-ui';
-    ctx.fillText('No daily data yet — check back after the next hourly computation.', 12, H / 2);
+    drawSeriesChart(canvas, legendEl, [], {}, { emptyText: 'No daily data yet — check back after the next hourly computation.' });
     return;
   }
-
-  const series = { penman_monteith: days.map(d => d.et0_mm) };
+  const xLabels = days.map(d => d.date);
+  const series = {};
+  if (dailyMode === 'absolute') series.penman_monteith = days.map(d => d.et0_mm);
   days.forEach((d, i) => {
     for (const [method, value] of Object.entries(d.et0_alt_mm)) {
-      (series[method] ??= Array(days.length).fill(null))[i] = value;
+      (series[method] ??= Array(days.length).fill(null))[i] = dailyMode === 'delta' ? value - d.et0_mm : value;
     }
   });
-
-  const allValues = Object.values(series).flat().filter(v => v != null);
-  const yMax = Math.max(...allValues, 0.1) * 1.1;
-  const pad = { l: 36, r: 12, t: 10, b: 22 };
-  const plotW = W - pad.l - pad.r;
-  const plotH = H - pad.t - pad.b;
-  const xFor = i => pad.l + (days.length === 1 ? plotW / 2 : (i / (days.length - 1)) * plotW);
-  const yFor = v => pad.t + plotH - (v / yMax) * plotH;
-
-  ctx.strokeStyle = '#1e293b';
-  ctx.fillStyle = '#64748b';
-  ctx.font = '11px system-ui';
-  ctx.textAlign = 'right';
-  for (let i = 0; i <= 4; i++) {
-    const v = (yMax / 4) * i;
-    const y = yFor(v);
-    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
-    ctx.fillText(v.toFixed(1), pad.l - 6, y + 3);
-  }
-
-  ctx.textAlign = 'center';
-  [0, Math.floor((days.length - 1) / 2), days.length - 1].forEach(i => {
-    ctx.fillText(days[i].date, xFor(i), H - 4);
-  });
-
-  for (const [method, values] of Object.entries(series)) {
-    const color = methodColor[method] || '#94a3b8';
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    let started = false;
-    values.forEach((v, i) => {
-      if (v == null) { started = false; return; }
-      const x = xFor(i), y = yFor(v);
-      if (!started) { ctx.moveTo(x, y); started = true; } else { ctx.lineTo(x, y); }
-    });
-    ctx.stroke();
-
-    const sw = document.createElement('span');
-    sw.innerHTML = `<span style="display:inline-block;width:10px;height:10px;border-radius:2px;` +
-      `background:${color};margin-right:.4rem;vertical-align:middle"></span>${methodLabel[method] || method}`;
-    legendEl.appendChild(sw);
-  }
+  drawSeriesChart(canvas, legendEl, xLabels, series, { zeroLine: dailyMode === 'delta' });
 }
 
-window.addEventListener('resize', () => drawDailyChart(lastDailyDays));
+window.addEventListener('resize', () => {
+  drawDailyChart(lastDailyDays);
+  drawTodayChart(lastTodayHours.hours, lastTodayHours.finalized);
+  drawIntradayChart(lastIntradayHours.hours, lastIntradayHours.finalized);
+});
+
+todayStepper = makeDayStepper({
+  prevBtn: document.getElementById('today-prev'),
+  nextBtn: document.getElementById('today-next'),
+  labelEl: document.getElementById('today-label'),
+  initial: addDays(todayStr(), -1),
+  onChange: loadToday,
+});
+intradayStepper = makeDayStepper({
+  prevBtn: document.getElementById('intraday-prev'),
+  nextBtn: document.getElementById('intraday-next'),
+  labelEl: document.getElementById('intraday-label'),
+  initial: addDays(todayStr(), -1),
+  onChange: loadIntraday,
+});
+setSection(localStorage.getItem(PIN_KEY) === '1' ? 'today' : (localStorage.getItem(SECTION_KEY) || 'today'), { persist: false });
 
 loadStations();
-setInterval(refresh, 30_000);
+setInterval(() => {
+  refresh();
+  if (section === 'today' && todayStepper.get() === todayStr()) loadToday();
+  if (researchView === 'intraday' && intradayLoadedOnce && intradayStepper.get() === todayStr()) loadIntraday();
+}, 30_000);
 </script>
 </body>
 </html>

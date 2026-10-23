@@ -264,6 +264,45 @@ class Database:
             ).fetchall()
         return [dict(r) for r in rows]
 
+    _AGGREGATE_DIMENSIONS = ("temperature", "humidity", "wind_speed", "solar_radiation", "pressure")
+
+    def get_daily_aggregate(self, start_ts: int, end_ts: int) -> dict | None:
+        """Min/max/mean per weather dimension over [start_ts, end_ts). Prefers
+        raw observations; falls back to the hourly archive (observations_hourly)
+        once raw data for that window has aged out and been downsampled -
+        combining each hourly bucket's own min/max/mean (min-of-mins,
+        max-of-maxes, sample-count-weighted mean) rather than needing the raw
+        rows to still exist. None if neither source has anything for the
+        window."""
+        raw = self.get_range(start_ts, end_ts)
+        if raw:
+            agg = {}
+            for dim in self._AGGREGATE_DIMENSIONS:
+                values = [r[dim] for r in raw if r[dim] is not None]
+                if values:
+                    agg[f"{dim}_min"] = min(values)
+                    agg[f"{dim}_max"] = max(values)
+                    agg[f"{dim}_mean"] = sum(values) / len(values)
+                else:
+                    agg[f"{dim}_min"] = agg[f"{dim}_max"] = agg[f"{dim}_mean"] = None
+            agg["sample_count"] = len(raw)
+            return agg
+
+        buckets = self.get_archive_range(start_ts, end_ts)
+        if not buckets:
+            return None
+        agg = {}
+        for dim in self._AGGREGATE_DIMENSIONS:
+            mins   = [b[f"{dim}_min"] for b in buckets if b[f"{dim}_min"] is not None]
+            maxs   = [b[f"{dim}_max"] for b in buckets if b[f"{dim}_max"] is not None]
+            means  = [(b[f"{dim}_mean"], b["sample_count"]) for b in buckets if b[f"{dim}_mean"] is not None]
+            agg[f"{dim}_min"] = min(mins) if mins else None
+            agg[f"{dim}_max"] = max(maxs) if maxs else None
+            weight = sum(n for _, n in means)
+            agg[f"{dim}_mean"] = sum(v * n for v, n in means) / weight if weight else None
+        agg["sample_count"] = sum(b["sample_count"] for b in buckets)
+        return agg
+
     def archive_old_observations(self, keep_hours: int) -> int:
         """Downsample raw observations older than `keep_hours` into hourly
         min/max/mean buckets (observations_hourly, kept indefinitely — a

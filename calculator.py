@@ -26,16 +26,15 @@ def _sat_vp(T: float) -> float:
     return 0.6108 * math.exp(17.27 * T / (T + 237.3))
 
 
-def compute_etp(db, latitude: float, elevation: float, anemometer_height: float = 2.0) -> dict | None:
-    """
-    Return a result dict {computed_at, window_start, window_end, et0_mm, observation_count}
-    or None when there are too few observations to be meaningful (< 6 h of data).
-    """
-    obs = db.get_window(hours=24)
-
-    # Require at least ~6 h of 1-minute observations
+def _compute_from_observations(obs: list[dict], latitude: float, elevation: float,
+                                anemometer_height: float, J: int, min_obs: int = 60) -> dict | None:
+    """Aggregate a batch of raw observations into the daily inputs FAO-56 needs,
+    then run _fao56. Shared by compute_etp (rolling 24h window) and
+    compute_etp_intraday (growing same-day prefix) so both paths run the exact
+    same formula. Returns None when there are too few observations to be
+    meaningful (< min_obs rows with temperature+humidity)."""
     obs = [o for o in obs if o["temperature"] is not None and o["humidity"] is not None]
-    if len(obs) < 60:
+    if len(obs) < min_obs:
         return None
 
     temps   = [o["temperature"] for o in obs]
@@ -66,19 +65,92 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     Rs_wm2  = sum(solars) / len(solars) if solars else 0.0
     T_dew_mean = sum(dews) / len(dews) if dews else None
 
-    # Day of year from midpoint of observation window
-    timestamps = [o["timestamp"] for o in obs]
-    J = datetime.utcfromtimestamp((max(timestamps) + min(timestamps)) / 2).timetuple().tm_yday
-
     result = _fao56(T_mean, T_max, T_min, RH_mean, u_mean, T_dew_mean, Rs_wm2,
                      latitude, elevation, anemometer_height, J)
+    timestamps = [o["timestamp"] for o in obs]
     return {
-        "computed_at":       int(time.time()),
         "window_start":      min(timestamps),
         "window_end":        max(timestamps),
         "observation_count": len(obs),
         **result,
     }
+
+
+def compute_etp(db, latitude: float, elevation: float, anemometer_height: float = 2.0) -> dict | None:
+    """
+    Return a result dict {computed_at, window_start, window_end, et0_mm, observation_count}
+    or None when there are too few observations to be meaningful (< 6 h of data).
+    """
+    obs = db.get_window(hours=24)
+    timestamps = [o["timestamp"] for o in obs if o["temperature"] is not None and o["humidity"] is not None]
+    if not timestamps:
+        return None
+
+    # Day of year from midpoint of observation window
+    J = datetime.utcfromtimestamp((max(timestamps) + min(timestamps)) / 2).timetuple().tm_yday
+
+    result = _compute_from_observations(obs, latitude, elevation, anemometer_height, J)
+    if result is None:
+        return None
+    return {"computed_at": int(time.time()), **result}
+
+
+def compute_etp_intraday(obs: list[dict], day_start_ts: int, targets: dict, max_hour: int = 24) -> list[dict]:
+    """Cumulative ET0 "through hour h" for a single local calendar day, for
+    each method, distributing `targets` (that day's finalized et0_mm/
+    et0_alt_mm, or - for today-in-progress - the latest rolling-24h estimate)
+    across the hours proportionally to each hour's own mean solar radiation.
+
+    Rerunning the full FAO-56 formula on a growing same-day prefix was tried
+    first and rejected: Rn/VPD/wind swing enough hour to hour that the
+    "result so far" is not monotonic (it rises *and falls* through the day
+    instead of accumulating) - it answers "what would today's rate look like
+    with only this much data" rather than "how much ET0 has happened so far".
+    Weighting by solar share instead guarantees a curve that rises from 0 to
+    exactly `targets` by construction (Rn, the dominant driver of ET0, tracks
+    solar input directly) while still reflecting each day's own actual diurnal
+    shape. An hour with no observations at all gets weight 0 (flat segment,
+    not a guess); if the whole window has no solar data (no sensor, or every
+    reading None), falls back to a uniform elapsed-time distribution rather
+    than producing an all-zero curve.
+
+    Returns [] if `obs` is empty (no raw/per-minute data for this day at all -
+    e.g. a daily-summary-only station) or `targets` has no et0_mm (nothing to
+    distribute)."""
+    if not obs or targets.get("et0_mm") is None:
+        return []
+
+    hourly_solar = [[] for _ in range(max_hour)]
+    hourly_has_obs = [False] * max_hour
+    for o in obs:
+        h = int((o["timestamp"] - day_start_ts) // 3600)
+        if not (0 <= h < max_hour):
+            continue
+        hourly_has_obs[h] = True
+        if o.get("solar_radiation") is not None:
+            hourly_solar[h].append(o["solar_radiation"])
+
+    weights = [sum(v) / len(v) if v else 0.0 for v in hourly_solar]
+    weights = [w if has else 0.0 for w, has in zip(weights, hourly_has_obs)]
+    total_weight = sum(weights)
+    if total_weight <= 0:
+        # No usable solar signal - spread evenly over hours that have any data.
+        weights = [1.0 if has else 0.0 for has in hourly_has_obs]
+        total_weight = sum(weights)
+    if total_weight <= 0:
+        return []
+
+    alt_methods = list(targets.get("et0_alt_mm") or {})
+    hours, running = [], 0.0
+    for h in range(max_hour):
+        running += weights[h]
+        frac = running / total_weight
+        hours.append({
+            "hour": h + 1,
+            "et0_mm": round(targets["et0_mm"] * frac, 3),
+            "et0_alt_mm": {m: round(targets["et0_alt_mm"][m] * frac, 3) for m in alt_methods},
+        })
+    return hours
 
 
 def compute_etp_from_summary(summary: dict, latitude: float, elevation: float,
