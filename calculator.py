@@ -18,7 +18,7 @@ methods over the same rolling 24-hour window so they can be compared:
 
 import math
 import time
-from datetime import datetime
+from datetime import date, datetime
 
 
 def _sat_vp(T: float) -> float:
@@ -63,7 +63,61 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     T_min  = min(temps)
     RH_mean = sum(rhs) / len(rhs)
     u_mean  = sum(winds) / len(winds) if winds else 0.0
+    Rs_wm2  = sum(solars) / len(solars) if solars else 0.0
+    T_dew_mean = sum(dews) / len(dews) if dews else None
 
+    # Day of year from midpoint of observation window
+    timestamps = [o["timestamp"] for o in obs]
+    J = datetime.utcfromtimestamp((max(timestamps) + min(timestamps)) / 2).timetuple().tm_yday
+
+    result = _fao56(T_mean, T_max, T_min, RH_mean, u_mean, T_dew_mean, Rs_wm2,
+                     latitude, elevation, anemometer_height, J)
+    return {
+        "computed_at":       int(time.time()),
+        "window_start":      min(timestamps),
+        "window_end":        max(timestamps),
+        "observation_count": len(obs),
+        **result,
+    }
+
+
+def compute_etp_from_summary(summary: dict, latitude: float, elevation: float,
+                              anemometer_height: float, day: date) -> dict | None:
+    """Like compute_etp, but from a pre-aggregated daily summary (e.g. Xweather's
+    /observations/summary) instead of deriving min/max/mean from locally-polled
+    samples - a vendor's own QC'd daily aggregate reflects their full data
+    stream for the station, not just whatever we managed to poll every
+    PWSWEATHER_POLL_SECONDS. `summary` is that endpoint's per-day object
+    (temp/rh/wind/dewpt/solrad sub-objects, each with maxC/minC/avgC or
+    max/min/avg depending on the field). Returns None if the minimum inputs
+    (temp max/min/avg, rh avg) aren't present."""
+    temp = summary.get("temp") or {}
+    rh = summary.get("rh") or {}
+    wind = summary.get("wind") or {}
+    dewpt = summary.get("dewpt") or {}
+    solrad = summary.get("solrad") or {}
+
+    T_max, T_min, T_mean, RH_mean = temp.get("maxC"), temp.get("minC"), temp.get("avgC"), rh.get("avg")
+    if T_max is None or T_min is None or T_mean is None or RH_mean is None:
+        return None
+
+    J = day.timetuple().tm_yday
+    result = _fao56(T_mean, T_max, T_min, RH_mean, wind.get("avgMPS") or 0.0, dewpt.get("avgC"),
+                     solrad.get("avgWM2") or 0.0, latitude, elevation, anemometer_height, J)
+    return {
+        "computed_at":       int(time.time()),
+        "observation_count": temp.get("count"),
+        **result,
+    }
+
+
+def _fao56(T_mean: float, T_max: float, T_min: float, RH_mean: float, u_mean: float,
+           T_dew_mean: float | None, Rs_wm2: float, latitude: float, elevation: float,
+           anemometer_height: float, J: int) -> dict:
+    """Core FAO-56 Penman-Monteith (+ the four alternative methods), given
+    already-aggregated daily inputs - shared by compute_etp (aggregated from
+    our own polled observations) and compute_etp_from_summary (aggregated by
+    the vendor itself). Returns {et0_mm, et0_alt_mm}."""
     # Adjust wind speed from anemometer height to 2 m (FAO-56 eq. 47)
     if anemometer_height != 2.0 and anemometer_height > 1.0:
         u2 = u_mean * 4.87 / math.log(67.8 * anemometer_height - 5.42)
@@ -82,8 +136,7 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     # Actual vapour pressure (kPa): prefer the station's directly-measured
     # dew point (ASCE (2005) eq. 8) over the RH*es(T_mean) approximation -
     # a measurement beats a derivation from two other measurements.
-    if dews:
-        T_dew_mean = sum(dews) / len(dews)
+    if T_dew_mean is not None:
         ea = _sat_vp(T_dew_mean)
     else:
         ea = _sat_vp(T_mean) * RH_mean / 100
@@ -92,12 +145,7 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     delta = 4098 * _sat_vp(T_mean) / (T_mean + 237.3) ** 2
 
     # Solar radiation: mean W/m² → MJ/m²/day (FAO-56 §3.3)
-    Rs_wm2 = sum(solars) / len(solars) if solars else 0.0
     Rs = Rs_wm2 * 86400 / 1e6  # MJ/m²/day
-
-    # Day of year from midpoint of observation window
-    timestamps = [o["timestamp"] for o in obs]
-    J = datetime.utcfromtimestamp((max(timestamps) + min(timestamps)) / 2).timetuple().tm_yday
 
     lat_rad = math.radians(latitude)
 
@@ -155,11 +203,7 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     ET0_turc = max(0.013 * (T_mean / (T_mean + 15)) * (23.8846 * Rs + 50) * turc_k, 0.0)
 
     return {
-        "computed_at":       int(time.time()),
-        "window_start":      min(timestamps),
-        "window_end":        max(timestamps),
-        "et0_mm":            round(ET0, 3),
-        "observation_count": len(obs),
+        "et0_mm": round(ET0, 3),
         "et0_alt_mm": {
             "hargreaves_samani": round(ET0_hs, 3),
             "priestley_taylor":  round(ET0_pt, 3),

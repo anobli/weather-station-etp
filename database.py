@@ -167,19 +167,23 @@ class Database:
         return [self._decode_etp(dict(r)) for r in rows]
 
     def get_etp_range(self, start_ts: int | None = None, end_ts: int | None = None) -> list[dict]:
-        """ETP results (never purged) whose window_end falls between start_ts
-        (inclusive) and end_ts (exclusive); unbounded on either side when
+        """ETP results (never purged) whose window_end falls in
+        [start_ts, end_ts] (both inclusive); unbounded on either side when
         None. Oldest first. Filtered by window_end (the period a row is
         *about*), not computed_at (when it was learned) - those are nearly
         identical for the normal hourly cron, but can diverge a lot for a
         station that republishes historical days in one batch (e.g.
-        stations/meteofrance.py backfilling a whole year on each refresh)."""
+        stations/meteofrance.py backfilling a whole year on each refresh).
+        end_ts inclusive matters here: callers commonly pass a day's own
+        local-midnight-end boundary as end_ts (export.local_day_bounds),
+        which is exactly the window_end of the row representing that whole
+        day - an exclusive bound would silently drop it."""
         query, params = "SELECT * FROM etp_results WHERE 1=1", []
         if start_ts is not None:
             query += " AND window_end >= ?"
             params.append(start_ts)
         if end_ts is not None:
-            query += " AND window_end < ?"
+            query += " AND window_end <= ?"
             params.append(end_ts)
         query += " ORDER BY window_end ASC"
         with self._conn() as c:

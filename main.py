@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import export
-from calculator import compute_etp
+from calculator import compute_etp, compute_etp_from_summary
 from database import Database
 from stations import WeatherStationListener, create_listener
 
@@ -140,6 +140,39 @@ def run_archive():
             logger.info("[%s] Archived %d hourly bucket(s) of raw observations", name, written)
 
 
+def run_pwsweather_summary_refresh():
+    """Once a day's complete, refine its ETP using Xweather's own QC'd daily
+    summary (temp/RH/wind/dewpoint/solar max/min/avg from their full data
+    stream for the station) instead of leaving it at whatever the hourly
+    cron derived from our own locally-polled samples. Targets the exact
+    same window_start/window_end the hourly hits at local midnight
+    (export.local_day_bounds), so store_etp's upsert-by-window_end replaces
+    that day's row in place rather than competing with it. Covers a few
+    trailing days, not just yesterday, to ride out a late/failed Xweather
+    publish or a missed run (safe to re-run: same upsert)."""
+    for name, st in stations.items():
+        if not hasattr(st, "fetch_daily_summary"):
+            continue  # only PWSWeatherListener has a summary endpoint to call
+        lat = st.latitude if st.latitude is not None else LATITUDE
+        elev = st.elevation if st.elevation is not None else ELEVATION
+        for days_ago in range(1, 4):
+            day = date.today() - timedelta(days=days_ago)
+            try:
+                summary = st.fetch_daily_summary(day)
+                if not summary:
+                    continue
+                result = compute_etp_from_summary(summary, lat, elev, ANEMOMETER_HEIGHT, day)
+                if not result:
+                    logger.warning("[%s] %s: summary present but missing required fields", name, day)
+                    continue
+                window_start, window_end = export.local_day_bounds(day, TZ)
+                st.db.store_etp({**result, "window_start": window_start, "window_end": window_end})
+                logger.info("[%s] %s: refined ETP from Xweather daily summary: %.3f mm/day",
+                            name, day, result["et0_mm"])
+            except Exception:
+                logger.exception("[%s] Daily summary refresh failed for %s", name, day)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     for st in stations.values():
@@ -147,6 +180,8 @@ async def lifespan(app: FastAPI):
         st.start()
     sched.add_job(run_etp,     "cron", minute=0)       # top of every hour
     sched.add_job(run_archive, "cron", hour=3, minute=0)  # daily downsample + purge
+    sched.add_job(run_pwsweather_summary_refresh, "cron", hour=1, minute=30)
+    sched.add_job(run_pwsweather_summary_refresh, "date", run_date=datetime.now())  # once, in the background
     sched.start()
     run_etp()   # immediate first computation on startup
     yield

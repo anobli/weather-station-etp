@@ -19,6 +19,12 @@ API_BASE = "https://data.api.xweather.com/observations"
 # Historical data (2011-08-02 to now); returns one full station-local day
 # per call regardless of time-of-day in `from`, and has no `to` parameter.
 ARCHIVE_API_BASE = "https://data.api.xweather.com/observations/archive"
+# Xweather's own QC'd daily aggregate (max/min/avg temp, RH, wind, dewpoint,
+# solar radiation, ...) for the station - same history range as the archive
+# endpoint, updated roughly every 20 minutes. Used to refine a day's ETP
+# with more authoritative inputs than our own locally-polled samples once
+# the day is complete (see main.py's run_pwsweather_summary_refresh).
+SUMMARY_API_BASE = "https://data.api.xweather.com/observations/summary"
 POLL_SECONDS_DEFAULT = 300
 # How many days of history to backfill from the archive endpoint when a
 # station starts with an empty DB (e.g. first deploy, or a fresh volume) -
@@ -203,3 +209,27 @@ class PWSWeatherListener(WeatherStationListener):
                 self.publish(self._record_from_ob(ob))
                 inserted += 1
             logger.info("[backfill %s] %s: inserted %d observation(s)", self.station_id, day, inserted)
+
+    def fetch_daily_summary(self, day: date) -> dict | None:
+        """Xweather's own daily-aggregate summary for `day` (station-local),
+        or None if unavailable (not yet published, request failed, or no
+        data for that day). See SUMMARY_API_BASE."""
+        url = f"{SUMMARY_API_BASE}/{quote(self.station_id)}?" + urlencode({
+            "from": day.isoformat(),
+            "to": day.isoformat(),
+            "client_id": self.client_id,
+            "client_secret": self.client_secret,
+        })
+        try:
+            with urllib.request.urlopen(url, timeout=30) as resp:
+                payload = json.load(resp)
+        except urllib.error.URLError as e:
+            logger.error("PWSWeather summary request failed for %s: %s", day, e)
+            return None
+
+        if not payload.get("success"):
+            logger.error("PWSWeather summary API error for %s: %s", day, payload.get("error"))
+            return None
+
+        periods = ((payload.get("response") or {}).get("periods")) or []
+        return periods[0].get("summary") if periods else None
