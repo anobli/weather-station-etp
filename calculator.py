@@ -18,7 +18,7 @@ methods over the same rolling 24-hour window so they can be compared:
 
 import math
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta, timezone
 
 
 def _sat_vp(T: float) -> float:
@@ -93,6 +93,74 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
     if result is None:
         return None
     return {"computed_at": int(time.time()), **result}
+
+
+def compute_etp_hourly(db, latitude: float, longitude: float, elevation: float,
+                        anemometer_height: float, tz, min_obs: int = 6) -> dict | None:
+    """True single-hour ET0 (mm *for that hour*, via the FAO-56 hourly
+    Penman-Monteith equation - see _fao56_hourly), from the last 1h of raw
+    observations only. Distinct from compute_etp: that one also runs every
+    hour, but over a rolling 24h window, so it's still a *daily* rate
+    recomputed hourly, not a measure of what happened in any particular
+    hour. Returns None when there's too little data in the hour to be
+    meaningful (< min_obs rows with temperature+humidity)."""
+    obs = db.get_window(hours=1)
+    obs = [o for o in obs if o["temperature"] is not None and o["humidity"] is not None]
+    if len(obs) < min_obs:
+        return None
+
+    temps   = [o["temperature"] for o in obs]
+    rhs     = [o["humidity"] for o in obs]
+    winds   = [o["wind_speed"] for o in obs if o["wind_speed"] is not None]
+    solars  = [o["solar_radiation"] for o in obs if o["solar_radiation"] is not None]
+    dews    = [o["dew_point"] for o in obs if o.get("dew_point") is not None]
+
+    # Same rationale as _compute_from_observations: prefer the config
+    # recorded on each row over the caller's current config.
+    lats  = [o["latitude"] for o in obs if o.get("latitude") is not None]
+    elevs = [o["elevation"] for o in obs if o.get("elevation") is not None]
+    anems = [o["anemometer_height"] for o in obs if o.get("anemometer_height") is not None]
+    if lats:
+        latitude = sum(lats) / len(lats)
+    if elevs:
+        elevation = sum(elevs) / len(elevs)
+    if anems:
+        anemometer_height = sum(anems) / len(anems)
+
+    T_mean  = sum(temps) / len(temps)
+    RH_mean = sum(rhs) / len(rhs)
+    u_mean  = sum(winds) / len(winds) if winds else 0.0
+    Rs_wm2  = sum(solars) / len(solars) if solars else 0.0
+    T_dew_mean = sum(dews) / len(dews) if dews else None
+
+    timestamps = [o["timestamp"] for o in obs]
+    window_start, window_end = min(timestamps), max(timestamps)
+    midpoint = (window_start + window_end) / 2
+    dt_utc = datetime.fromtimestamp(midpoint, tz=timezone.utc)
+    J = dt_utc.timetuple().tm_yday
+
+    # FAO-56's hourly sun-angle equations need the hour's midpoint as decimal
+    # *standard* (non-DST) local clock time, plus the standard time zone's
+    # own meridian - both derived from `tz`'s actual UTC offset at this
+    # instant (minus any DST currently in effect) rather than a hardcoded
+    # zone, so it keeps working across a DST transition without separate
+    # configuration.
+    local_dt = dt_utc.astimezone(tz)
+    dst = local_dt.dst() or timedelta(0)
+    standard_offset = local_dt.utcoffset() - dst
+    t_local = dt_utc.replace(tzinfo=None) + standard_offset
+    t_standard = t_local.hour + t_local.minute / 60 + t_local.second / 3600
+    lz = -(standard_offset.total_seconds() / 3600) * 15
+
+    result = _fao56_hourly(T_mean, RH_mean, u_mean, T_dew_mean, Rs_wm2,
+                            latitude, longitude, elevation, anemometer_height, J, t_standard, lz)
+    return {
+        "computed_at":       int(time.time()),
+        "window_start":      window_start,
+        "window_end":        window_end,
+        "observation_count": len(obs),
+        **result,
+    }
 
 
 def compute_etp_intraday(obs: list[dict], day_start_ts: int, targets: dict, max_hour: int = 24) -> list[dict]:
@@ -283,3 +351,94 @@ def _fao56(T_mean: float, T_max: float, T_min: float, RH_mean: float, u_mean: fl
             "turc":              round(ET0_turc, 3),
         },
     }
+
+
+# FAO-56 Box 11: when Rso≈0 (night), Rs/Rso is undefined - the standard
+# recommends substituting the ratio from a period shortly before sunset, or,
+# absent that, a fixed value in the 0.4-0.8 range depending on climate. This
+# runs independently hour by hour with no "last daylight hour" state to look
+# back to, so it always uses this one fixed stand-in.
+NIGHT_RS_RSO = 0.7
+
+
+def _fao56_hourly(T_hr: float, RH_hr: float, u_hr: float, T_dew_hr: float | None,
+                   Rs_wm2_hr: float, latitude: float, longitude: float, elevation: float,
+                   anemometer_height: float, J: int, t_standard: float, lz: float) -> dict:
+    """FAO-56 hourly (or shorter) Penman-Monteith ET0 (Allen et al. 1998,
+    Box 11 / eq. 53), in mm *for that hour* - not mm/day. Takes already
+    hour-aggregated inputs, mirroring _fao56's daily shape, but is otherwise
+    a different formula, not the daily one run on a smaller window:
+
+    - no T_max/T_min spread (not meaningful over 1h) - es/delta use the
+      hour's own mean temperature directly;
+    - Ra/Rso need the sun's actual position *during this hour*, not just
+      the day-of-year (the daily version integrates over the whole
+      sunrise-to-sunset span, so only needs latitude + J); that position
+      depends on longitude and the hour's standard-time clock time, via
+      `t_standard`/`lz` (see compute_etp_hourly);
+    - soil heat flux G is small enough to ignore over a full day (daytime
+      and nighttime flux roughly cancel) but not over a single hour, so it's
+      computed and subtracted from Rn here;
+    - the aerodynamic term's constant is 37, not 900 (FAO-56 eq. 53 vs. 6 -
+      both already bake in the mm/[period] conversion for their own period).
+    """
+    if anemometer_height != 2.0 and anemometer_height > 1.0:
+        u2 = u_hr * 4.87 / math.log(67.8 * anemometer_height - 5.42)
+    else:
+        u2 = u_hr
+
+    P = 101.3 * ((293 - 0.0065 * elevation) / 293) ** 5.26
+    gamma = 0.000665 * P
+
+    es = _sat_vp(T_hr)
+    ea = _sat_vp(T_dew_hr) if T_dew_hr is not None else _sat_vp(T_hr) * RH_hr / 100
+    delta = 4098 * _sat_vp(T_hr) / (T_hr + 237.3) ** 2
+
+    Rs = Rs_wm2_hr * 3600 / 1e6  # MJ/m²/hour
+
+    lat_rad = math.radians(latitude)
+    lm = -longitude  # FAO-56 convention: degrees *west* of Greenwich
+
+    dr      = 1 + 0.033 * math.cos(2 * math.pi * J / 365)
+    delta_s = 0.409 * math.sin(2 * math.pi * J / 365 - 1.39)
+    omega_s = math.acos(max(-1.0, min(1.0, -math.tan(lat_rad) * math.tan(delta_s))))
+
+    # Seasonal correction for solar time (FAO-56 eq. 32) and the sun's hour
+    # angle at the hour's midpoint/bounds (eq. 31, 29-30).
+    b  = 2 * math.pi * (J - 81) / 364
+    Sc = 0.1645 * math.sin(2 * b) - 0.1255 * math.cos(b) - 0.025 * math.sin(b)
+    omega  = (math.pi / 12) * ((t_standard + 0.06667 * (lz - lm) + Sc) - 12)
+    omega1 = max(-omega_s, min(omega_s, omega - math.pi / 24))
+    omega2 = max(-omega_s, min(omega_s, omega + math.pi / 24))
+    omega1 = min(omega1, omega2)  # guard: hour entirely before sunrise/after sunset
+
+    # Hourly extraterrestrial radiation Ra (FAO-56 eq. 28), zero through the
+    # night since omega1==omega2 there.
+    Ra = max(0.0, (12 * 60 / math.pi) * 0.0820 * dr * (
+        (omega2 - omega1) * math.sin(lat_rad) * math.sin(delta_s)
+        + math.cos(lat_rad) * math.cos(delta_s) * (math.sin(omega2) - math.sin(omega1))
+    ))
+    Rso = (0.75 + 2e-5 * elevation) * Ra
+
+    rs_rso = min(Rs / Rso, 1.0) if Rso > 0.01 else NIGHT_RS_RSO
+
+    # Hourly Stefan-Boltzmann constant: the daily one (4.903e-9 MJ/m²/day/K⁴)
+    # scaled down to a per-hour flux.
+    sigma = 4.903e-9 / 24
+    Rnl = (
+        sigma * (T_hr + 273.16) ** 4
+        * (0.34 - 0.14 * math.sqrt(max(ea, 0.0)))
+        * (1.35 * rs_rso - 0.35)
+    )
+    Rns = (1 - 0.23) * Rs
+    Rn  = Rns - Rnl
+
+    # Hourly soil heat flux (FAO-56 eq. 45-46 for grass/short crops).
+    G = 0.1 * Rn if Rn >= 0 else 0.5 * Rn
+
+    ET0 = (
+        0.408 * delta * (Rn - G) + gamma * (37 / (T_hr + 273)) * u2 * (es - ea)
+    ) / (delta + gamma * (1 + 0.34 * u2))
+    ET0 = max(ET0, 0.0)
+
+    return {"et0_mm": round(ET0, 3)}

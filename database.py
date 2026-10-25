@@ -63,6 +63,21 @@ class Database:
                     et0_alt_mm      TEXT
                 );
                 CREATE INDEX IF NOT EXISTS idx_etp_ts ON etp_results(computed_at);
+
+                -- True single-hour ET0 (FAO-56 hourly Penman-Monteith, see
+                -- calculator.compute_etp_hourly) - distinct from etp_results,
+                -- whose rows are a rolling-24h *daily* rate recomputed every
+                -- hour, not what happened in any one hour. No et0_alt_mm:
+                -- the other four methods aren't defined at hourly scale.
+                CREATE TABLE IF NOT EXISTS etp_hourly_results (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    computed_at     INTEGER NOT NULL,
+                    hour_start      INTEGER NOT NULL,
+                    hour_end        INTEGER NOT NULL,
+                    et0_mm          REAL NOT NULL,
+                    observation_count INTEGER
+                );
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_etp_hourly_hour_end ON etp_hourly_results(hour_end);
             """)
             # Migration for DBs created before et0_alt_mm existed.
             columns = {row["name"] for row in c.execute("PRAGMA table_info(etp_results)")}
@@ -145,6 +160,33 @@ class Database:
                  result["et0_mm"], result["observation_count"],
                  json.dumps(result.get("et0_alt_mm")) if result.get("et0_alt_mm") else None),
             )
+
+    def store_etp_hourly(self, result: dict):
+        """Upsert keyed by hour_end - same rationale as store_etp (the
+        normal hourly cron always produces a fresh hour_end, so this behaves
+        like a plain insert; re-running the same hour, e.g. after a restart,
+        safely replaces it rather than growing a duplicate)."""
+        with self._conn() as c:
+            c.execute(
+                """INSERT INTO etp_hourly_results
+                   (computed_at, hour_start, hour_end, et0_mm, observation_count)
+                   VALUES (?, ?, ?, ?, ?)
+                   ON CONFLICT(hour_end) DO UPDATE SET
+                       computed_at=excluded.computed_at, hour_start=excluded.hour_start,
+                       et0_mm=excluded.et0_mm, observation_count=excluded.observation_count""",
+                (result["computed_at"], result["window_start"], result["window_end"],
+                 result["et0_mm"], result["observation_count"]),
+            )
+
+    def get_etp_hourly_range(self, start_ts: int, end_ts: int) -> list[dict]:
+        """True-hourly ET0 rows (see store_etp_hourly) whose hour_end falls in
+        [start_ts, end_ts] (both inclusive). Oldest first."""
+        with self._conn() as c:
+            rows = c.execute(
+                "SELECT * FROM etp_hourly_results WHERE hour_end >= ? AND hour_end <= ? ORDER BY hour_end ASC",
+                (start_ts, end_ts),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     @staticmethod
     def _decode_etp(row: dict) -> dict:

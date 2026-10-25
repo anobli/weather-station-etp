@@ -10,7 +10,7 @@ from fastapi import FastAPI, HTTPException
 from fastapi.responses import HTMLResponse, JSONResponse, Response
 
 import export
-from calculator import compute_etp, compute_etp_from_summary, compute_etp_intraday
+from calculator import compute_etp, compute_etp_from_summary, compute_etp_hourly, compute_etp_intraday
 from database import Database
 from stations import WeatherStationListener, create_listener
 
@@ -118,9 +118,9 @@ def run_etp():
     for name, st in stations.items():
         if not st.computes_own_etp:
             continue  # e.g. meteofrance: refreshed on its own schedule in _run(), nothing to compute here
+        latitude = st.latitude if st.latitude is not None else LATITUDE
+        elevation = st.elevation if st.elevation is not None else ELEVATION
         try:
-            latitude = st.latitude if st.latitude is not None else LATITUDE
-            elevation = st.elevation if st.elevation is not None else ELEVATION
             result = compute_etp(st.db, latitude, elevation, ANEMOMETER_HEIGHT)
             if result:
                 st.db.store_etp(result)
@@ -131,6 +131,24 @@ def run_etp():
                 logger.warning("[%s] Insufficient observations for ETP computation", name)
         except Exception:
             logger.exception("[%s] ETP computation failed", name)
+
+        # True single-hour ET0 (FAO-56 hourly Penman-Monteith, 1h window) -
+        # a separate computation/table from the rolling-24h one above, which
+        # is a *daily* rate just recomputed every hour, not a measure of
+        # that hour alone. Kept in its own try so a failure here never blocks
+        # the rolling-24h value the rest of the app (Today's big number,
+        # daily chart, history) depends on.
+        try:
+            longitude = st.longitude if st.longitude is not None else LONGITUDE
+            hourly = compute_etp_hourly(st.db, latitude, longitude, elevation, ANEMOMETER_HEIGHT, TZ)
+            if hourly:
+                st.db.store_etp_hourly(hourly)
+                logger.info("[%s] Hourly ETP penman_monteith=%.3f mm (%d obs)",
+                            name, hourly["et0_mm"], hourly["observation_count"])
+            else:
+                logger.warning("[%s] Insufficient observations for hourly ETP computation", name)
+        except Exception:
+            logger.exception("[%s] Hourly ETP computation failed", name)
 
 
 def run_archive():
@@ -338,6 +356,37 @@ def etp_intraday(date: date, station: str | None = None):
     obs = st.db.get_range(day_start_ts, query_end_ts)
     hours = compute_etp_intraday(obs, day_start_ts, targets, max_hour)
     return {"date": date.isoformat(), "finalized": finalized, "hours": hours}
+
+
+@app.get("/api/etp/hourly")
+def etp_hourly(date: date, station: str | None = None):
+    """Each hour's own true ET0 (mm, FAO-56 hourly Penman-Monteith over that
+    hour's 1h window - calculator.compute_etp_hourly/run_etp) across the
+    given local calendar day. Unlike /api/etp/intraday (which distributes a
+    *known daily total* across hours by solar share), these are independent
+    per-hour computations - so, unlike that endpoint, this one is never
+    monotonic/cumulative and a given hour can come back null if there wasn't
+    enough data in it, regardless of neighbouring hours."""
+    st = _station(station)
+    today_local = datetime.now(TZ).date()
+    if date > today_local:
+        raise HTTPException(status_code=400, detail="date cannot be in the future")
+    day_start_ts, day_end_ts = export.local_day_bounds(date, TZ)
+    rows = st.db.get_etp_hourly_range(day_start_ts, day_end_ts)
+
+    # hour N is the period ending at local clock hour N (1..24) - same
+    # convention as etp_intraday's `hour` field, so both can share the chart
+    # x-axis/renderer on the frontend.
+    by_hour = {}
+    for r in rows:
+        h = round((r["hour_end"] - day_start_ts) / 3600)
+        if 1 <= h <= 24:
+            by_hour[h] = r["et0_mm"]
+
+    return {
+        "date": date.isoformat(),
+        "hours": [{"hour": h, "et0_mm": by_hour.get(h)} for h in range(1, 25)],
+    }
 
 
 @app.get("/api/observations/daily-summary")
@@ -573,7 +622,8 @@ _HTML = """<!DOCTYPE html>
     .chip-val  { font-size:1.05rem; font-weight:700; display:block; margin-top:.3rem; }
     .chip-sub  { font-size:.65rem; color:#64748b; display:block; margin-top:.1rem; }
     .chip-lbl  { font-size:.65rem; color:#94a3b8; text-transform:uppercase; letter-spacing:.05em; }
-    #today-chart, #intraday-chart { width:100%; }
+    #today-chart, #today-hourly-chart, #intraday-chart { width:100%; }
+    .chart-lbl { font-size:.75rem; color:#94a3b8; margin:0 0 .4rem; }
 
     @media (max-width: 767px) {
       body { padding-bottom: 5.5rem; }
@@ -618,7 +668,10 @@ _HTML = """<!DOCTYPE html>
         </div>
       </div>
       <div class="today-right">
+        <p class="chart-lbl">Cumulative ET0 through the day</p>
         <canvas id="today-chart" height="240"></canvas>
+        <p class="chart-lbl" style="margin-top:1.25rem">Hourly ET0 (each hour's own FAO-56 Penman-Monteith, 1h window)</p>
+        <canvas id="today-hourly-chart" height="200"></canvas>
       </div>
     </div>
   </section>
@@ -972,28 +1025,43 @@ function drawSeriesChart(canvas, legendEl, xLabels, series, opts = {}) {
     const values = series[method];
     if (!values) continue;
     const color = (opts.colorFor ? opts.colorFor(method) : methodColor[method]) || '#94a3b8';
-    let lastDefined = -1;
-    values.forEach((v, i) => { if (v != null) lastDefined = i; });
 
-    ctx.strokeStyle = color;
-    ctx.lineWidth = 2;
-    ctx.beginPath();
-    let started = false;
-    values.forEach((v, i) => {
-      if (v == null) { started = false; return; }
-      const x = xFor(i), y = yFor(v);
-      if (!started) { ctx.moveTo(x, y); started = true; return; }
-      if (markPartial && i === lastDefined) {
-        ctx.setLineDash([4, 4]);
-        ctx.lineTo(x, y);
-        ctx.stroke();
-        ctx.beginPath();
-        ctx.setLineDash([]);
-      } else {
-        ctx.lineTo(x, y);
-      }
-    });
-    ctx.stroke();
+    if (opts.bars) {
+      // Discrete per-bucket values (e.g. each hour's own ET0) rather than a
+      // continuous curve - independent bars instead of a connected line, so
+      // a null bucket just leaves a gap rather than a break in a line.
+      const barW = Math.max(3, (plotW / xLabels.length) * 0.6);
+      const y0 = yFor(0);
+      ctx.fillStyle = color;
+      values.forEach((v, i) => {
+        if (v == null) return;
+        const x = xFor(i), y = yFor(v);
+        ctx.fillRect(x - barW / 2, Math.min(y, y0), barW, Math.abs(y0 - y));
+      });
+    } else {
+      let lastDefined = -1;
+      values.forEach((v, i) => { if (v != null) lastDefined = i; });
+
+      ctx.strokeStyle = color;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      let started = false;
+      values.forEach((v, i) => {
+        if (v == null) { started = false; return; }
+        const x = xFor(i), y = yFor(v);
+        if (!started) { ctx.moveTo(x, y); started = true; return; }
+        if (markPartial && i === lastDefined) {
+          ctx.setLineDash([4, 4]);
+          ctx.lineTo(x, y);
+          ctx.stroke();
+          ctx.beginPath();
+          ctx.setLineDash([]);
+        } else {
+          ctx.lineTo(x, y);
+        }
+      });
+      ctx.stroke();
+    }
 
     if (showLegend) {
       const sw = document.createElement('span');
@@ -1020,6 +1088,16 @@ function drawTodayChart(hoursData, finalized) {
   drawSeriesChart(canvas, null, xLabels, { penman_monteith: hoursData.map(h => h.et0_mm) }, {
     showLegend: false, yMin: 0.1, markPartial: !finalized,
     emptyText: 'No accumulation data for this day.',
+    methods: ['penman_monteith'],
+  });
+}
+
+function drawTodayHourlyChart(hoursData) {
+  const canvas = document.getElementById('today-hourly-chart');
+  const xLabels = hoursData.map(h => String(h.hour));
+  drawSeriesChart(canvas, null, xLabels, { penman_monteith: hoursData.map(h => h.et0_mm) }, {
+    showLegend: false, yMin: 0.05, bars: true,
+    emptyText: 'No hourly data for this day yet.',
     methods: ['penman_monteith'],
   });
 }
@@ -1072,6 +1150,9 @@ async function loadToday() {
   document.getElementById('chip-wind').textContent = agg.wind_speed_mean != null ? `${agg.wind_speed_mean.toFixed(1)} m/s` : '—';
   lastTodayHours = intraday;
   drawTodayChart(intraday.hours, intraday.finalized);
+  const hourly = await fetch(q('/api/etp/hourly', `&date=${dateStr}`))
+    .then(r => r.ok ? r.json() : { hours: [] }).catch(() => ({ hours: [] }));
+  drawTodayHourlyChart(hourly.hours);
 }
 
 async function loadIntraday() {
