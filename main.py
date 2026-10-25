@@ -620,6 +620,9 @@ _HTML = """<!DOCTYPE html>
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>Weather Station ETP</title>
   <style>
+    /* class rules like .badge-inprogress {display:block} would otherwise
+       override the hidden attribute */
+    [hidden] { display:none !important; }
     *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
     body  { font-family: system-ui, sans-serif; background: #0f172a; color: #e2e8f0; padding: 2rem; }
     h1    { font-size: 1.4rem; color: #7dd3fc; margin-bottom: 1.5rem; }
