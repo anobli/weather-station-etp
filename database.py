@@ -15,7 +15,9 @@ class Database:
 
     @contextmanager
     def _conn(self):
-        c = sqlite3.connect(self.path, check_same_thread=False)
+        # Generous lock wait: backfills and several station drivers write
+        # concurrently with dashboard reads.
+        c = sqlite3.connect(self.path, timeout=30, check_same_thread=False)
         c.row_factory = sqlite3.Row
         try:
             yield c
@@ -25,6 +27,10 @@ class Database:
 
     def init(self):
         with self._conn() as c:
+            # WAL lets readers proceed while a writer commits (the default
+            # rollback journal locks them out, which broke /api/stations
+            # during the PWSWeather backfill). Persistent in the DB file.
+            c.execute("PRAGMA journal_mode=WAL")
             c.executescript("""
                 CREATE TABLE IF NOT EXISTS observations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
