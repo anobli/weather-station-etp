@@ -201,7 +201,7 @@ def run_archive():
             logger.info("[%s] Archived %d hourly bucket(s) of raw observations", name, written)
 
 
-def run_pwsweather_summary_refresh():
+def run_pwsweather_summary_refresh(catch_up: bool = False):
     """Once a day's complete, refine its ETP using Xweather's own QC'd daily
     summary (temp/RH/wind/dewpoint/solar max/min/avg from their full data
     stream for the station) instead of leaving it at whatever the hourly
@@ -210,14 +210,25 @@ def run_pwsweather_summary_refresh():
     (export.local_day_bounds), so store_etp's upsert-by-window_end replaces
     that day's row in place rather than competing with it. Covers a few
     trailing days, not just yesterday, to ride out a late/failed Xweather
-    publish or a missed run (safe to re-run: same upsert)."""
+    publish or a missed run (safe to re-run: same upsert). With catch_up
+    (startup only), also fills every older day in the station's backfill
+    window that has no ETP row yet."""
     for name, st in stations.items():
         if not hasattr(st, "fetch_daily_summary"):
             continue  # only PWSWeatherListener has a summary endpoint to call
         lat = st.latitude if st.latitude is not None else LATITUDE
         elev = st.elevation if st.elevation is not None else ELEVATION
-        for days_ago in range(1, 4):
-            day = date.today() - timedelta(days=days_ago)
+        days = [date.today() - timedelta(days=n) for n in range(1, 4)]
+        if catch_up:
+            # Older days in the backfill window with no ETP yet (e.g. history
+            # pulled from the archive on first start); fetched once, then
+            # skipped on later starts since they'll have a row.
+            oldest = date.today() - timedelta(days=max(st.backfill_days - 1, 3))
+            have = {datetime.fromtimestamp(r["window_end"], tz=TZ).date() - timedelta(days=1)
+                    for r in st.db.get_etp_range(export.local_day_bounds(oldest, TZ)[0], None)}
+            days += [oldest + timedelta(days=n) for n in range((days[-1] - oldest).days)
+                     if oldest + timedelta(days=n) not in have]
+        for day in days:
             try:
                 summary = st.fetch_daily_summary(day)
                 if not summary:
@@ -242,7 +253,8 @@ async def lifespan(app: FastAPI):
     sched.add_job(run_etp,     "cron", minute=0)       # top of every hour
     sched.add_job(run_archive, "cron", hour=3, minute=0)  # daily downsample + purge
     sched.add_job(run_pwsweather_summary_refresh, "cron", hour=1, minute=30)
-    sched.add_job(run_pwsweather_summary_refresh, "date", run_date=datetime.now())  # once, in the background
+    sched.add_job(run_pwsweather_summary_refresh, "date", run_date=datetime.now(),
+                  kwargs={"catch_up": True})  # once, in the background
     sched.add_job(run_etp_hourly_backfill, "date", run_date=datetime.now())  # once, in the background
     sched.start()
     run_etp()   # immediate first computation on startup

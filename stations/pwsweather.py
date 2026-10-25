@@ -26,11 +26,11 @@ ARCHIVE_API_BASE = "https://data.api.xweather.com/observations/archive"
 # the day is complete (see main.py's run_pwsweather_summary_refresh).
 SUMMARY_API_BASE = "https://data.api.xweather.com/observations/summary"
 POLL_SECONDS_DEFAULT = 300
-# How many days of history to backfill from the archive endpoint when a
-# station starts with an empty DB (e.g. first deploy, or a fresh volume) -
+# How many days of history to keep backfilled from the archive endpoint
+# (checked on every start, so raising it later pulls in older days too) -
 # so ET0 and the dashboard have useful data immediately instead of waiting
 # for live polling to accumulate it one poll at a time. 0 disables it.
-BACKFILL_DAYS_DEFAULT = 7
+BACKFILL_DAYS_DEFAULT = 30
 
 
 def _split_api_key(key: str) -> tuple[str, str]:
@@ -100,13 +100,16 @@ class PWSWeatherListener(WeatherStationListener):
         if self.backfill_days > 0:
             end = date.today()
             earliest = self.db.earliest_observation_day()
-            # No local data at all: bootstrap a bounded recent window. Some
-            # local data: scan all of it (not just that window) for gaps
+            # Cover at least the configured window (so raising
+            # PWSWEATHER_BACKFILL_DAYS reaches further back on the next
+            # start), plus any older local data, scanning it all for gaps
             # (downtime) or rows missing a field added after they were
             # recorded (dew_point, latitude, ...) - re-running this after
             # adding a new field backfills it everywhere without needing to
             # wipe the DB.
-            start = earliest if earliest is not None else end - timedelta(days=self.backfill_days - 1)
+            start = end - timedelta(days=self.backfill_days - 1)
+            if earliest is not None:
+                start = min(start, earliest)
             gap_days = self.db.incomplete_days(start, end)
             if gap_days:
                 logger.info(
