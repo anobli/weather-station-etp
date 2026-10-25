@@ -43,6 +43,13 @@ class WeatherStationListener(ABC):
     # from Xweather's own daily summary - see main.py's
     # run_pwsweather_summary_refresh).
     computes_own_etp: bool = True
+    # False for a driver with no raw per-reading observations to compute a
+    # true single-hour ET0 from (main.py's run_etp hourly pass + startup
+    # backfill, feeding Today's hourly/accumulated charts). Separate from
+    # computes_own_etp: PWSWeather takes its *daily* ETP from Xweather's
+    # summary but still polls raw readings every few minutes, which is
+    # plenty for the hourly value.
+    computes_hourly_etp: bool = True
     # Seconds since the last observation after which a station is considered
     # disconnected; override for drivers that poll on a longer interval.
     stale_after: float = 120

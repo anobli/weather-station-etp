@@ -79,6 +79,7 @@ def fetch_year(lat: float, lon: float, year: int) -> tuple[tuple[float, float], 
 class MeteoFranceListener(WeatherStationListener):
     name = "meteofrance"
     computes_own_etp = False
+    computes_hourly_etp = False  # daily grid values only, no raw readings
     stale_after = REFRESH_SECONDS * 2 + 3600
 
     def __init__(self, db, instance_id: str | None = None):

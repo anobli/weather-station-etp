@@ -116,47 +116,54 @@ def _station(name: str | None) -> WeatherStationListener:
 
 def run_etp():
     for name, st in stations.items():
-        if not st.computes_own_etp:
-            continue  # e.g. meteofrance: refreshed on its own schedule in _run(), nothing to compute here
         latitude = st.latitude if st.latitude is not None else LATITUDE
         elevation = st.elevation if st.elevation is not None else ELEVATION
-        try:
-            result = compute_etp(st.db, latitude, elevation, ANEMOMETER_HEIGHT)
-            if result:
-                st.db.store_etp(result)
-                alt = ", ".join(f"{m}={v:.3f}" for m, v in result["et0_alt_mm"].items())
-                logger.info("[%s] ETP penman_monteith=%.3f mm/day (%d obs) %s",
-                            name, result["et0_mm"], result["observation_count"], alt)
-            else:
-                logger.warning("[%s] Insufficient observations for ETP computation", name)
-        except Exception:
-            logger.exception("[%s] ETP computation failed", name)
-
-        # True single-hour ET0 (FAO-56 hourly Penman-Monteith, 1h window) -
-        # a separate computation/table from the rolling-24h one above, which
-        # is a *daily* rate just recomputed every hour, not a measure of
-        # that hour alone. Kept in its own try so a failure here never blocks
-        # the rolling-24h value the rest of the app (Today's big number,
-        # daily chart, history) depends on.
-        try:
-            longitude = st.longitude if st.longitude is not None else LONGITUDE
-            # Snap to the top of the hour so cron, startup and backfill rows
-            # all share the same hour_end (store_etp_hourly upserts on it).
-            hour_end = int(time.time()) // 3600 * 3600
-            hourly = compute_etp_hourly(st.db, latitude, longitude, elevation, ANEMOMETER_HEIGHT, TZ,
-                                        now=hour_end)
-            if hourly:
-                st.db.store_etp_hourly(hourly)
-                logger.info("[%s] Hourly ETP penman_monteith=%.3f mm (%d obs)",
-                            name, hourly["et0_mm"], hourly["observation_count"])
-            else:
-                logger.warning("[%s] Insufficient observations for hourly ETP computation", name)
-        except Exception:
-            logger.exception("[%s] Hourly ETP computation failed", name)
+        if st.computes_own_etp:  # e.g. meteofrance/pwsweather: daily ETP comes from their own source
+            _run_etp_rolling(name, st, latitude, elevation)
+        if st.computes_hourly_etp:
+            _run_etp_hourly(name, st, latitude, elevation)
 
 
-def run_etp_hourly_backfill():
-    """One-shot catch-up for etp_hourly_results: Tempest/Ecowitt already keep
+def _run_etp_rolling(name, st, latitude, elevation):
+    try:
+        result = compute_etp(st.db, latitude, elevation, ANEMOMETER_HEIGHT)
+        if result:
+            st.db.store_etp(result)
+            alt = ", ".join(f"{m}={v:.3f}" for m, v in result["et0_alt_mm"].items())
+            logger.info("[%s] ETP penman_monteith=%.3f mm/day (%d obs) %s",
+                        name, result["et0_mm"], result["observation_count"], alt)
+        else:
+            logger.warning("[%s] Insufficient observations for ETP computation", name)
+    except Exception:
+        logger.exception("[%s] ETP computation failed", name)
+
+
+def _run_etp_hourly(name, st, latitude, elevation):
+    # True single-hour ET0 (FAO-56 hourly Penman-Monteith, 1h window) -
+    # a separate computation/table from _run_etp_rolling, which
+    # is a *daily* rate just recomputed every hour, not a measure of
+    # that hour alone. Kept in its own try so a failure here never blocks
+    # the rolling-24h value the rest of the app (Today's big number,
+    # daily chart, history) depends on.
+    try:
+        longitude = st.longitude if st.longitude is not None else LONGITUDE
+        # Snap to the top of the hour so cron, startup and backfill rows
+        # all share the same hour_end (store_etp_hourly upserts on it).
+        hour_end = int(time.time()) // 3600 * 3600
+        hourly = compute_etp_hourly(st.db, latitude, longitude, elevation, ANEMOMETER_HEIGHT, TZ,
+                                    now=hour_end)
+        if hourly:
+            st.db.store_etp_hourly(hourly)
+            logger.info("[%s] Hourly ETP penman_monteith=%.3f mm (%d obs)",
+                        name, hourly["et0_mm"], hourly["observation_count"])
+        else:
+            logger.warning("[%s] Insufficient observations for hourly ETP computation", name)
+    except Exception:
+        logger.exception("[%s] Hourly ETP computation failed", name)
+
+
+def run_etp_hourly_backfill(lookback_hours: int = OBSERVATION_RETENTION_HOURS):
+    """One-shot catch-up for etp_hourly_results: Tempest/Ecowitt/PWSWeather already keep
     raw per-minute history going back up to OBSERVATION_RETENTION_HOURS, so
     every past hour's true ET0 can be computed locally right away instead of
     only building up one new row per real hour that passes after this
@@ -165,14 +172,14 @@ def run_etp_hourly_backfill():
     already stored, so a restart after the first run is a cheap no-op."""
     now_ts = int(time.time())
     for name, st in stations.items():
-        if not st.computes_own_etp:
+        if not st.computes_hourly_etp:
             continue
         earliest_day = st.db.earliest_observation_day()
         if not earliest_day:
             continue
         earliest_ts = int(datetime(earliest_day.year, earliest_day.month, earliest_day.day,
                                     tzinfo=timezone.utc).timestamp())
-        start_ts = max(earliest_ts, now_ts - OBSERVATION_RETENTION_HOURS * 3600)
+        start_ts = max(earliest_ts, now_ts - lookback_hours * 3600)
         existing = {r["hour_end"] for r in st.db.get_etp_hourly_range(start_ts, now_ts)}
         latitude = st.latitude if st.latitude is not None else LATITUDE
         longitude = st.longitude if st.longitude is not None else LONGITUDE
@@ -256,6 +263,12 @@ async def lifespan(app: FastAPI):
     sched.add_job(run_pwsweather_summary_refresh, "date", run_date=datetime.now(),
                   kwargs={"catch_up": True})  # once, in the background
     sched.add_job(run_etp_hourly_backfill, "date", run_date=datetime.now())  # once, in the background
+    # ...and again every hour: picks up history that arrived after startup
+    # (PWSWeather's archive backfill runs in its own thread and can finish
+    # after the startup pass) or hours missed during downtime. Cheap - every
+    # already-stored hour is skipped.
+    sched.add_job(run_etp_hourly_backfill, "cron", minute=10,
+                  kwargs={"lookback_hours": 31 * 24})  # covers PWSWeather's 30-day archive backfill
     sched.start()
     run_etp()   # immediate first computation on startup
     yield
@@ -1145,12 +1158,13 @@ function hoursToSeries(hoursData) {
 // local midnight, growing one hour at a time) - not compute_etp_intraday's
 // distribution of an already-known daily total by solar share. A missing
 // hour (null - too little data that hour) contributes nothing rather than
-// breaking the running total.
+// breaking the running total. Hours before the first one with data stay
+// null, so a day with no hourly data at all shows "no data", not a flat 0.
 function cumulativeFromHourly(hoursData) {
-  let running = 0;
+  let running = null;
   return hoursData.map(h => {
-    if (h.et0_mm != null) running += h.et0_mm;
-    return { hour: h.hour, et0_mm: Math.round(running * 1000) / 1000 };
+    if (h.et0_mm != null) running = (running ?? 0) + h.et0_mm;
+    return { hour: h.hour, et0_mm: running == null ? null : Math.round(running * 1000) / 1000 };
   });
 }
 
