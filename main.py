@@ -669,6 +669,10 @@ _HTML = """<!DOCTYPE html>
             font-weight:600; cursor:pointer; text-transform:capitalize; }
     .tab.active { background:#7dd3fc; color:#0f172a; }
 
+    .station-bar { display:flex; align-items:center; gap:.75rem; flex-wrap:wrap; margin-bottom:1.25rem; }
+    .station-bar .tabs { margin:0; }
+    .station-bar-lbl { font-size:.7rem; text-transform:uppercase; letter-spacing:.06em; color:#94a3b8; }
+    .station-name { font-weight:700; color:#7dd3fc; }
     .section-nav { display:flex; gap:.5rem; margin-bottom:1.5rem; }
     .section-btn { flex:1; padding:.7rem 1rem; border:none; border-radius:.5rem; background:#1e293b;
                    color:#94a3b8; font-weight:700; font-size:.95rem; cursor:pointer; }
@@ -718,6 +722,14 @@ _HTML = """<!DOCTYPE html>
     <button class="section-btn" data-section="research">Research</button>
   </nav>
 
+  <!-- Which station every tab is showing. Never picked implicitly when
+       there's more than one: the page waits for an explicit choice. -->
+  <div class="station-bar" id="station-bar" hidden>
+    <span class="station-bar-lbl">Station</span>
+    <nav class="tabs" id="tabs"></nav>
+  </div>
+  <div class="state-msg" id="station-pick" hidden>Select a station above to see its data.</div>
+
   <section id="section-today">
     <div class="day-stepper" id="today-stepper">
       <button class="step-btn" id="today-prev" aria-label="Previous day">‹</button>
@@ -749,7 +761,6 @@ _HTML = """<!DOCTYPE html>
   </section>
 
   <section id="section-research" hidden>
-  <nav class="tabs" id="tabs" hidden></nav>
   <nav class="tabs" id="research-tabs">
     <button class="tab active" data-view="monitor">Monitor</button>
     <button class="tab" data-view="daily">Daily ETP Chart</button>
@@ -936,22 +947,36 @@ let dailyEnd = '';
 let browseMode = 'raw';
 let browseLoadedOnce = false;
 let station = null;
+let stationsLoaded = false;
 const q = (path, extra = '') => `${path}?station=${encodeURIComponent(station)}${extra}`;
 
+const stationLabel = { tempest: 'Tempest', ecowitt: 'Ecowitt', pwsweather: 'PWSWeather', meteofrance: 'Météo France' };
+const labelFor = n => stationLabel[n] || n;
+
+// The station is never chosen implicitly (not the first in the list, not a
+// remembered or URL-provided one): with several stations, nothing loads
+// until one is clicked. A single station is simply shown by name.
 async function loadStations() {
   const { stations = [] } = await fetch('/api/stations').then(r => r.json()).catch(() => ({}));
   const names = stations.map(s => s.station_type);
-  station = names.includes(location.hash.slice(1)) ? location.hash.slice(1) : names[0];
   const tabs = document.getElementById('tabs');
-  tabs.hidden = names.length < 2;
-  tabs.innerHTML = names.map(n => `<button class="tab" data-st="${n}">${n}</button>`).join('');
+  document.getElementById('station-bar').hidden = names.length === 0;
+  if (names.length === 1) {
+    tabs.innerHTML = `<span class="station-name">${labelFor(names[0])}</span>`;
+    station = names[0];
+  } else {
+    tabs.innerHTML = names.map(n => `<button class="tab" data-st="${n}">${labelFor(n)}</button>`).join('');
+    station = null;
+  }
   tabs.onclick = e => {
-    if (!e.target.dataset.st) return;
-    station = e.target.dataset.st;
-    location.hash = station;
+    const st = e.target.dataset.st;
+    if (!st || st === station) return;
+    station = st;
     selectStation();
   };
-  selectStation();
+  stationsLoaded = true;
+  if (station) selectStation();
+  else setSection(section, { persist: false });  // shows the "select a station" prompt
 }
 
 let researchView = 'monitor';
@@ -1294,8 +1319,9 @@ document.getElementById('intraday-retry').onclick = loadIntraday;
 function setSection(newSection, { persist = true } = {}) {
   section = newSection;
   document.querySelectorAll('.section-btn').forEach(b => b.classList.toggle('active', b.dataset.section === section));
-  document.getElementById('section-today').hidden = section !== 'today';
-  document.getElementById('section-research').hidden = section !== 'research';
+  document.getElementById('station-pick').hidden = !!station || !stationsLoaded;
+  document.getElementById('section-today').hidden = !station || section !== 'today';
+  document.getElementById('section-research').hidden = !station || section !== 'research';
   if (persist) localStorage.setItem(SECTION_KEY, section);
   if (section === 'today') loadToday();
 }
@@ -1440,6 +1466,7 @@ async function loadBrowse() {
 
 function selectStation() {
   document.querySelectorAll('#tabs .tab').forEach(t => t.classList.toggle('active', t.dataset.st === station));
+  setSection(section, { persist: false });  // reveal the section now that a station is chosen
   document.getElementById('export-daily').href = q('/api/export/daily');
   document.getElementById('export-station').value = station;
   // Clear the previous station's values until the new ones arrive.
@@ -1451,7 +1478,6 @@ function selectStation() {
   loadDaily();
   if (browseLoadedOnce) loadBrowse();
   if (intradayLoadedOnce) loadIntraday();
-  if (section === 'today') loadToday();
   refresh();
 }
 
