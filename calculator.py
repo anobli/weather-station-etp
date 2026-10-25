@@ -96,15 +96,20 @@ def compute_etp(db, latitude: float, elevation: float, anemometer_height: float 
 
 
 def compute_etp_hourly(db, latitude: float, longitude: float, elevation: float,
-                        anemometer_height: float, tz, min_obs: int = 6) -> dict | None:
+                        anemometer_height: float, tz, min_obs: int = 6,
+                        now: float | None = None) -> dict | None:
     """True single-hour ET0 (mm *for that hour*, via the FAO-56 hourly
-    Penman-Monteith equation - see _fao56_hourly), from the last 1h of raw
-    observations only. Distinct from compute_etp: that one also runs every
-    hour, but over a rolling 24h window, so it's still a *daily* rate
-    recomputed hourly, not a measure of what happened in any particular
-    hour. Returns None when there's too little data in the hour to be
-    meaningful (< min_obs rows with temperature+humidity)."""
-    obs = db.get_window(hours=1)
+    Penman-Monteith equation - see _fao56_hourly), from the 1h window ending
+    at `now` (real time.time() if not given - a specific past value lets
+    main.py's startup backfill compute an already-elapsed hour instead of
+    only ever "the last hour from right now"). Distinct from compute_etp:
+    that one also runs every hour, but over a rolling 24h window, so it's
+    still a *daily* rate recomputed hourly, not a measure of what happened
+    in any particular hour. Returns None when there's too little data in
+    the hour to be meaningful (< min_obs rows with temperature+humidity)."""
+    window_end = int(now) if now is not None else int(time.time())
+    window_start = window_end - 3600
+    obs = db.get_range(window_start, window_end)
     obs = [o for o in obs if o["temperature"] is not None and o["humidity"] is not None]
     if len(obs) < min_obs:
         return None
@@ -133,8 +138,9 @@ def compute_etp_hourly(db, latitude: float, longitude: float, elevation: float,
     Rs_wm2  = sum(solars) / len(solars) if solars else 0.0
     T_dew_mean = sum(dews) / len(dews) if dews else None
 
-    timestamps = [o["timestamp"] for o in obs]
-    window_start, window_end = min(timestamps), max(timestamps)
+    # Use the exact requested boundaries (not min/max(timestamps)) for the
+    # sun-angle midpoint and the stored window - keeps a backfilled hour's
+    # position exact regardless of gaps in that hour's raw data.
     midpoint = (window_start + window_end) / 2
     dt_utc = datetime.fromtimestamp(midpoint, tz=timezone.utc)
     J = dt_utc.timetuple().tm_yday

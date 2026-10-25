@@ -140,7 +140,11 @@ def run_etp():
         # daily chart, history) depends on.
         try:
             longitude = st.longitude if st.longitude is not None else LONGITUDE
-            hourly = compute_etp_hourly(st.db, latitude, longitude, elevation, ANEMOMETER_HEIGHT, TZ)
+            # Snap to the top of the hour so cron, startup and backfill rows
+            # all share the same hour_end (store_etp_hourly upserts on it).
+            hour_end = int(time.time()) // 3600 * 3600
+            hourly = compute_etp_hourly(st.db, latitude, longitude, elevation, ANEMOMETER_HEIGHT, TZ,
+                                        now=hour_end)
             if hourly:
                 st.db.store_etp_hourly(hourly)
                 logger.info("[%s] Hourly ETP penman_monteith=%.3f mm (%d obs)",
@@ -149,6 +153,45 @@ def run_etp():
                 logger.warning("[%s] Insufficient observations for hourly ETP computation", name)
         except Exception:
             logger.exception("[%s] Hourly ETP computation failed", name)
+
+
+def run_etp_hourly_backfill():
+    """One-shot catch-up for etp_hourly_results: Tempest/Ecowitt already keep
+    raw per-minute history going back up to OBSERVATION_RETENTION_HOURS, so
+    every past hour's true ET0 can be computed locally right away instead of
+    only building up one new row per real hour that passes after this
+    feature shipped - otherwise Today's hourly/accumulated charts would
+    start out empty and only fill in live, one hour at a time. Skips hours
+    already stored, so a restart after the first run is a cheap no-op."""
+    now_ts = int(time.time())
+    for name, st in stations.items():
+        if not st.computes_own_etp:
+            continue
+        earliest_day = st.db.earliest_observation_day()
+        if not earliest_day:
+            continue
+        earliest_ts = int(datetime(earliest_day.year, earliest_day.month, earliest_day.day,
+                                    tzinfo=timezone.utc).timestamp())
+        start_ts = max(earliest_ts, now_ts - OBSERVATION_RETENTION_HOURS * 3600)
+        existing = {r["hour_end"] for r in st.db.get_etp_hourly_range(start_ts, now_ts)}
+        latitude = st.latitude if st.latitude is not None else LATITUDE
+        longitude = st.longitude if st.longitude is not None else LONGITUDE
+        elevation = st.elevation if st.elevation is not None else ELEVATION
+        filled = 0
+        hour_end = (start_ts // 3600 + 1) * 3600
+        while hour_end <= now_ts:
+            if hour_end not in existing:
+                try:
+                    result = compute_etp_hourly(st.db, latitude, longitude, elevation,
+                                                 ANEMOMETER_HEIGHT, TZ, now=hour_end)
+                    if result:
+                        st.db.store_etp_hourly(result)
+                        filled += 1
+                except Exception:
+                    logger.exception("[%s] Hourly ETP backfill failed for hour_end=%d", name, hour_end)
+            hour_end += 3600
+        if filled:
+            logger.info("[%s] Backfilled %d hourly ETP row(s)", name, filled)
 
 
 def run_archive():
@@ -200,6 +243,7 @@ async def lifespan(app: FastAPI):
     sched.add_job(run_archive, "cron", hour=3, minute=0)  # daily downsample + purge
     sched.add_job(run_pwsweather_summary_refresh, "cron", hour=1, minute=30)
     sched.add_job(run_pwsweather_summary_refresh, "date", run_date=datetime.now())  # once, in the background
+    sched.add_job(run_etp_hourly_backfill, "date", run_date=datetime.now())  # once, in the background
     sched.start()
     run_etp()   # immediate first computation on startup
     yield
@@ -668,7 +712,7 @@ _HTML = """<!DOCTYPE html>
         </div>
       </div>
       <div class="today-right">
-        <p class="chart-lbl">Cumulative ET0 through the day</p>
+        <p class="chart-lbl">Accumulated ET0 since midnight (running total of each hour's own value)</p>
         <canvas id="today-chart" height="240"></canvas>
         <p class="chart-lbl" style="margin-top:1.25rem">Hourly ET0 (each hour's own FAO-56 Penman-Monteith, 1h window)</p>
         <canvas id="today-hourly-chart" height="200"></canvas>
@@ -1082,6 +1126,19 @@ function hoursToSeries(hoursData) {
   return series;
 }
 
+// Running total of each hour's own true ET0 (a real floating window from
+// local midnight, growing one hour at a time) - not compute_etp_intraday's
+// distribution of an already-known daily total by solar share. A missing
+// hour (null - too little data that hour) contributes nothing rather than
+// breaking the running total.
+function cumulativeFromHourly(hoursData) {
+  let running = 0;
+  return hoursData.map(h => {
+    if (h.et0_mm != null) running += h.et0_mm;
+    return { hour: h.hour, et0_mm: Math.round(running * 1000) / 1000 };
+  });
+}
+
 function drawTodayChart(hoursData, finalized) {
   const canvas = document.getElementById('today-chart');
   const xLabels = hoursData.map(h => String(h.hour));
@@ -1114,18 +1171,16 @@ function drawIntradayChart(hoursData, finalized) {
 
 let todayStepper, intradayStepper, intradayLoadedOnce = false;
 let lastTodayHours = { hours: [], finalized: true };
+let lastTodayHourlyRaw = { hours: [] };
 let lastIntradayHours = { hours: [], finalized: true };
 
 async function loadToday() {
   if (!station) return;
   const dateStr = todayStepper.get();
   setState('today', 'loading');
-  let summary, intraday;
+  let summary;
   try {
-    [summary, intraday] = await Promise.all([
-      fetch(q('/api/observations/daily-summary', `&date=${dateStr}`)).then(r => r.ok ? r.json() : Promise.reject()),
-      fetch(q('/api/etp/intraday', `&date=${dateStr}`)).then(r => r.ok ? r.json() : Promise.reject()),
-    ]);
+    summary = await fetch(q('/api/observations/daily-summary', `&date=${dateStr}`)).then(r => r.ok ? r.json() : Promise.reject());
   } catch {
     setState('today', 'error');
     return;
@@ -1135,7 +1190,8 @@ async function loadToday() {
     return;
   }
   setState('today', 'content');
-  document.getElementById('today-badge').hidden = dateStr !== todayStr();
+  const finalized = dateStr !== todayStr();
+  document.getElementById('today-badge').hidden = finalized;
   document.getElementById('today-et0').innerHTML = summary.et0_mm != null
     ? `${summary.et0_mm.toFixed(2)}<span class="unit">mm/day</span>`
     : `—<span class="unit">mm/day</span>`;
@@ -1148,11 +1204,20 @@ async function loadToday() {
   document.getElementById('chip-hum').textContent = agg.humidity_mean != null ? `${agg.humidity_mean.toFixed(0)} %` : '—';
   document.getElementById('chip-dew').textContent = agg.dew_point_mean != null ? `${agg.dew_point_mean.toFixed(1)} °C` : '—';
   document.getElementById('chip-wind').textContent = agg.wind_speed_mean != null ? `${agg.wind_speed_mean.toFixed(1)} m/s` : '—';
-  lastTodayHours = intraday;
-  drawTodayChart(intraday.hours, intraday.finalized);
+
   const hourly = await fetch(q('/api/etp/hourly', `&date=${dateStr}`))
     .then(r => r.ok ? r.json() : { hours: [] }).catch(() => ({ hours: [] }));
-  drawTodayHourlyChart(hourly.hours);
+  // A finalized day shows its full 24h (gaps and all); today-in-progress only
+  // shows hours that have actually happened yet - otherwise the trailing,
+  // not-yet-occurred hours would flatline the running total out to hour 24
+  // and look like the day is already "done".
+  const elapsedHour = finalized ? 24 : new Date().getHours() + 1;
+  const hoursSoFar = hourly.hours.slice(0, Math.max(0, Math.min(24, elapsedHour)));
+  lastTodayHourlyRaw = { hours: hoursSoFar };
+  drawTodayHourlyChart(hoursSoFar);
+  const cumulative = cumulativeFromHourly(hoursSoFar);
+  lastTodayHours = { hours: cumulative, finalized };
+  drawTodayChart(cumulative, finalized);
 }
 
 async function loadIntraday() {
@@ -1434,6 +1499,7 @@ function drawDailyChart(days) {
 window.addEventListener('resize', () => {
   drawDailyChart(lastDailyDays);
   drawTodayChart(lastTodayHours.hours, lastTodayHours.finalized);
+  drawTodayHourlyChart(lastTodayHourlyRaw.hours);
   drawIntradayChart(lastIntradayHours.hours, lastIntradayHours.finalized);
 });
 
