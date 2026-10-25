@@ -1381,10 +1381,21 @@ async function loadBrowse() {
   }
 
   tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:#64748b">loading…</td></tr>`;
-  const data = await fetch(`${endpoint}?station=${encodeURIComponent(station)}&start=${start}&end=${end}`)
-    .then(r => r.ok ? r.json() : null).catch(() => null);
+  let data = null, error = null;
+  try {
+    const r = await fetch(`${endpoint}?station=${encodeURIComponent(station)}&start=${start}&end=${end}`);
+    if (r.ok) data = await r.json();
+    else error = `HTTP ${r.status}`;
+  } catch (err) {
+    error = err.message || 'network error';
+  }
 
-  if (!data || data.rows.length === 0) {
+  if (error) {
+    tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:#f87171">Failed to load data (${error}) — try again.</td></tr>`;
+    note.textContent = '';
+    return;
+  }
+  if (data.rows.length === 0) {
     tbody.innerHTML = `<tr><td colspan="${cols.length}" style="color:#64748b">No data in this range</td></tr>`;
     note.textContent = '';
     return;
