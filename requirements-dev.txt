@@ -1,0 +1,5 @@
+# Extra deps for the dev/test container (Dockerfile.dev), on top of the
+# app's own requirements.txt. httpx is what FastAPI's TestClient needs.
+-r requirements.txt
+pytest==8.3.3
+httpx==0.27.2

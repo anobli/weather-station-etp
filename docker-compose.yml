@@ -77,3 +77,31 @@ services:
       WATCHTOWER_LABEL_ENABLE: "true"
       WATCHTOWER_CLEANUP: "true"          # remove the superseded image
       WATCHTOWER_POLL_INTERVAL: ${WATCHTOWER_POLL_INTERVAL:-300}  # seconds
+
+  # Interactive dev/test sandbox: this project's Python toolchain + Claude
+  # Code, built from Dockerfile.dev. Not part of the deployed stack above —
+  # only runs when explicitly asked for, via its "dev" profile.
+  # Usage:
+  #   docker compose --profile dev run --rm dev
+  dev:
+    build:
+      context: .
+      dockerfile: Dockerfile.dev
+      args:
+        USER_UID: ${USER_UID:-1000}
+        USER_GID: ${USER_GID:-1000}
+    profiles: ["dev"]
+    working_dir: /app
+    volumes:
+      - .:/app
+      # Claude Code auth/state and git identity, shared from the host.
+      - ${HOME}/.claude:/home/dev/.claude
+      - ${HOME}/.gitconfig:/home/dev/.gitconfig:ro
+    environment:
+      DATA_DIR: /app/tmp/data
+      HTTP_PORT: ${HTTP_PORT:-8000}
+      STATION_TYPE: ${STATION_TYPE:-tempest}
+    ports:
+      - "${DEV_HTTP_PORT:-8000}:8000"
+    stdin_open: true
+    tty: true
