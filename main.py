@@ -223,6 +223,16 @@ def run_pwsweather_summary_refresh(catch_up: bool = False):
     for name, st in stations.items():
         if not hasattr(st, "fetch_daily_summary"):
             continue  # only PWSWeatherListener has a summary endpoint to call
+        # At startup this runs alongside the listener's first poll, which is
+        # what learns the station's real lat/elevation from Xweather. Give it
+        # a moment rather than computing with the env defaults (Paris unless
+        # overridden), which would store wrong values for every day.
+        for _ in range(60):
+            if st.latitude is not None and st.elevation is not None:
+                break
+            time.sleep(1)
+        else:
+            logger.warning("[%s] station location still unknown, using LATITUDE/ELEVATION env", name)
         lat = st.latitude if st.latitude is not None else LATITUDE
         elev = st.elevation if st.elevation is not None else ELEVATION
         days = [date.today() - timedelta(days=n) for n in range(1, 4)]
@@ -231,8 +241,11 @@ def run_pwsweather_summary_refresh(catch_up: bool = False):
             # pulled from the archive on first start); fetched once, then
             # skipped on later starts since they'll have a row.
             oldest = date.today() - timedelta(days=max(st.backfill_days - 1, 3))
+            # A row computed before a method was added (no key for it in
+            # et0_alt_mm) counts as missing, so it gets recomputed once.
             have = {datetime.fromtimestamp(r["window_end"], tz=TZ).date() - timedelta(days=1)
-                    for r in st.db.get_etp_range(export.local_day_bounds(oldest, TZ)[0], None)}
+                    for r in st.db.get_etp_range(export.local_day_bounds(oldest, TZ)[0], None)
+                    if "fao56_estimated_sun" in (r.get("et0_alt_mm") or {})}
             days += [oldest + timedelta(days=n) for n in range((days[-1] - oldest).days)
                      if oldest + timedelta(days=n) not in have]
         for day in days:
@@ -932,6 +945,7 @@ const methodLabel = {
   priestley_taylor:  'Priestley-Taylor',
   makkink:           'Makkink',
   turc:              'Turc',
+  fao56_estimated_sun: 'FAO-56, estimated sun',
 };
 const methodColor = {
   penman_monteith:   '#7dd3fc',
@@ -939,6 +953,7 @@ const methodColor = {
   priestley_taylor:  '#34d399',
   makkink:           '#fbbf24',
   turc:              '#c084fc',
+  fao56_estimated_sun: '#fb923c',
 };
 
 let lastDailyDays = [];

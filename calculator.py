@@ -14,6 +14,9 @@ methods over the same rolling 24-hour window so they can be compared:
   Priestley-Taylor since it skips net longwave radiation.
 - Turc (1961): solar radiation + temperature, with a dryness correction
   from mean relative humidity. Widely used in French agronomy.
+- FAO-56 with estimated sun: the same Penman-Monteith, but with solar
+  radiation estimated from the day's temperature range (FAO-56 eq. 50)
+  instead of the solar sensor - FAO-56's fallback when Rs isn't measured.
 """
 
 import math
@@ -307,26 +310,39 @@ def _fao56(T_mean: float, T_max: float, T_min: float, RH_mean: float, u_mean: fl
     # Clear-sky radiation Rso (FAO-56 eq. 37)
     Rso = max((0.75 + 2e-5 * elevation) * Ra, 0.01)
 
-    # Net shortwave radiation Rns (FAO-56 eq. 38, albedo α=0.23 for grass)
-    Rns = (1 - 0.23) * Rs
+    def penman_monteith(Rs: float) -> tuple[float, float]:
+        """FAO-56 Penman-Monteith for a given daily Rs (MJ/m²/day).
+        Returns (ET0 mm/day, Rn)."""
+        # Net shortwave radiation Rns (FAO-56 eq. 38, albedo α=0.23 for grass)
+        Rns = (1 - 0.23) * Rs
 
-    # Net longwave radiation Rnl (FAO-56 eq. 39)
-    sigma   = 4.903e-9  # MJ/m²/day/K⁴
-    rs_rso  = min(Rs / Rso, 1.0)
-    Rnl = (
-        sigma
-        * ((T_max + 273.16) ** 4 + (T_min + 273.16) ** 4) / 2
-        * (0.34 - 0.14 * math.sqrt(max(ea, 0.0)))
-        * (1.35 * rs_rso - 0.35)
-    )
+        # Net longwave radiation Rnl (FAO-56 eq. 39)
+        sigma   = 4.903e-9  # MJ/m²/day/K⁴
+        rs_rso  = min(Rs / Rso, 1.0)
+        Rnl = (
+            sigma
+            * ((T_max + 273.16) ** 4 + (T_min + 273.16) ** 4) / 2
+            * (0.34 - 0.14 * math.sqrt(max(ea, 0.0)))
+            * (1.35 * rs_rso - 0.35)
+        )
 
-    Rn = Rns - Rnl   # Net radiation (G≈0 for daily)
+        Rn = Rns - Rnl   # Net radiation (G≈0 for daily)
 
-    # FAO-56 Penman-Monteith (eq. 6)
-    ET0 = (
-        0.408 * delta * Rn + gamma * (900 / (T_mean + 273)) * u2 * (es - ea)
-    ) / (delta + gamma * (1 + 0.34 * u2))
-    ET0 = max(ET0, 0.0)
+        # FAO-56 Penman-Monteith (eq. 6)
+        et0 = (
+            0.408 * delta * Rn + gamma * (900 / (T_mean + 273)) * u2 * (es - ea)
+        ) / (delta + gamma * (1 + 0.34 * u2))
+        return max(et0, 0.0), Rn
+
+    ET0, Rn = penman_monteith(Rs)
+
+    # Same Penman-Monteith, but with Rs estimated from the day's temperature
+    # range instead of the solar sensor (FAO-56 eq. 50, Hargreaves radiation
+    # formula, kRs=0.16 for interior locations). This is FAO-56's own
+    # fallback when Rs isn't measured, and matches what services that only
+    # read temperature/humidity/wind from a PWS (e.g. Yardian) appear to do.
+    Rs_est = 0.16 * math.sqrt(max(T_max - T_min, 0.0)) * Ra
+    ET0_est_sun, _ = penman_monteith(Rs_est)
 
     # MJ/m²/day -> mm/day: divide by the latent heat of vaporisation λ
     # (≈2.45 MJ/kg at ~20°C), i.e. multiply by 1/λ = 0.408.
@@ -355,6 +371,7 @@ def _fao56(T_mean: float, T_max: float, T_min: float, RH_mean: float, u_mean: fl
             "priestley_taylor":  round(ET0_pt, 3),
             "makkink":           round(ET0_mk, 3),
             "turc":              round(ET0_turc, 3),
+            "fao56_estimated_sun": round(ET0_est_sun, 3),
         },
     }
 
