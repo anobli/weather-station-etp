@@ -872,7 +872,7 @@ _HTML = """<!DOCTYPE html>
     </form>
     <div class="tabs" id="daily-mode" style="margin-bottom:.75rem">
       <button type="button" class="tab active" data-mode="absolute">Absolute values</button>
-      <button type="button" class="tab" data-mode="delta">Delta vs Penman-Monteith</button>
+      <button type="button" class="tab" data-mode="delta">Delta vs FAO-56, estimated sun</button>
     </div>
     <canvas id="daily-chart" height="260" style="width:100%;max-width:100%"></canvas>
     <div id="daily-legend" style="display:flex;gap:1rem;flex-wrap:wrap;margin-top:.75rem;font-size:.75rem;color:#94a3b8"></div>
@@ -1587,8 +1587,16 @@ function drawDailyChart(days) {
   const series = {};
   if (dailyMode === 'absolute') series.penman_monteith = days.map(d => d.et0_mm);
   days.forEach((d, i) => {
+    // Delta baseline is FAO-56, estimated sun (the UI's default method) -
+    // falling back to Penman-Monteith on days/stations where it isn't
+    // available yet (e.g. Météo France, or rows predating this method).
+    const baseline = d.et0_alt_mm.fao56_estimated_sun ?? d.et0_mm;
     for (const [method, value] of Object.entries(d.et0_alt_mm)) {
-      (series[method] ??= Array(days.length).fill(null))[i] = dailyMode === 'delta' ? value - d.et0_mm : value;
+      if (dailyMode === 'delta' && method === 'fao56_estimated_sun') continue;  // it's the baseline itself
+      (series[method] ??= Array(days.length).fill(null))[i] = dailyMode === 'delta' ? value - baseline : value;
+    }
+    if (dailyMode === 'delta') {
+      (series.penman_monteith ??= Array(days.length).fill(null))[i] = d.et0_mm - baseline;
     }
   });
   drawSeriesChart(canvas, legendEl, xLabels, series, { zeroLine: dailyMode === 'delta' });
