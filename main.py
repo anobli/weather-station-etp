@@ -494,11 +494,13 @@ def daily_summary(date: date, station: str | None = None):
     rows = st.db.get_etp_range(start_ts - 3600, end_ts + 3600)
     match = _etp_by_day(rows).get(date)
     et0_mm = match[1]["et0_mm"] if match else None
+    et0_alt_mm = match[1]["et0_alt_mm"] if match else {}
 
     return {
         "date": date.isoformat(),
         "finalized": date < today_local,
         "et0_mm": et0_mm,
+        "et0_alt_mm": et0_alt_mm,
         "aggregates": aggregates,
     }
 
@@ -705,6 +707,7 @@ _HTML = """<!DOCTYPE html>
 
     .today-main { display:flex; flex-direction:column; gap:1.5rem; }
     .today-et0  { font-size:3rem; font-weight:800; }
+    .today-et0-method { font-size:.75rem; color:#94a3b8; margin-top:-.5rem; }
     .today-chips { display:flex; gap:.75rem; flex-wrap:wrap; margin-top:1.25rem; }
     .chip { background:#1e293b; border-radius:.6rem; padding:.85rem 1rem; flex:1; min-width:120px; text-align:center; }
     .chip-icon { font-size:1.3rem; display:block; }
@@ -756,6 +759,7 @@ _HTML = """<!DOCTYPE html>
     <div class="today-main" id="today-content" hidden>
       <div class="today-left">
         <div class="today-et0" id="today-et0">—<span class="unit">mm/day</span></div>
+        <div class="today-et0-method" id="today-et0-method"></div>
         <div class="today-chips" id="today-chips">
           <div class="chip"><span class="chip-icon">☀️</span><span class="chip-val" id="chip-solar">—</span><span class="chip-lbl">Solar</span></div>
           <div class="chip"><span class="chip-icon">🌡️</span><span class="chip-val" id="chip-temp">—</span><span class="chip-sub" id="chip-temp-range"></span><span class="chip-lbl">Temp</span></div>
@@ -820,6 +824,7 @@ _HTML = """<!DOCTYPE html>
   </table>
 
   <h2>ETP History — last 48 entries</h2>
+  <p class="sub" style="margin:-.5rem 0 .75rem">FAO-56, estimated sun where available, else Penman-Monteith.</p>
   <table>
     <thead><tr><th>Period</th><th>ETP mm/day</th><th>Observations</th></tr></thead>
     <tbody id="hist"><tr><td colspan="3" style="color:#64748b">loading…</td></tr></tbody>
@@ -1261,9 +1266,16 @@ async function loadToday() {
   setState('today', 'content');
   const finalized = dateStr !== todayStr();
   document.getElementById('today-badge').hidden = finalized;
-  document.getElementById('today-et0').innerHTML = summary.et0_mm != null
-    ? `${summary.et0_mm.toFixed(2)}<span class="unit">mm/day</span>`
+  // FAO-56, estimated sun tracks the competitor's numbers most closely, so
+  // it's the headline method - falling back to Penman-Monteith (measured
+  // sun) on stations/days where the estimated-sun alt isn't available
+  // (e.g. Météo France, which has no et0_alt_mm at all).
+  const headlineMethod = summary.et0_alt_mm?.fao56_estimated_sun != null ? 'fao56_estimated_sun' : 'penman_monteith';
+  const headlineEt0 = headlineMethod === 'fao56_estimated_sun' ? summary.et0_alt_mm.fao56_estimated_sun : summary.et0_mm;
+  document.getElementById('today-et0').innerHTML = headlineEt0 != null
+    ? `${headlineEt0.toFixed(2)}<span class="unit">mm/day</span>`
     : `—<span class="unit">mm/day</span>`;
+  document.getElementById('today-et0-method').textContent = headlineEt0 != null ? methodLabel[headlineMethod] : '';
   const agg = summary.aggregates || {};
   document.getElementById('chip-solar').textContent = agg.solar_radiation_mean != null
     ? `${(agg.solar_radiation_mean * 86400 / 1e6).toFixed(1)} MJ/m²/day` : '—';
@@ -1507,10 +1519,14 @@ async function refresh() {
   loadDaily();
 
   if (etp) {
+    // Same headline method as the Today tab: FAO-56, estimated sun when
+    // available, else Penman-Monteith (measured sun).
+    const headlineMethod = etp.et0_alt_mm_per_day?.fao56_estimated_sun != null ? 'fao56_estimated_sun' : 'penman_monteith';
+    const headlineEt0 = headlineMethod === 'fao56_estimated_sun' ? etp.et0_alt_mm_per_day.fao56_estimated_sun : etp.et0_mm_per_day;
     document.getElementById('etp').innerHTML =
-      `${etp.et0_mm_per_day.toFixed(2)}<span class="unit">mm/day</span>`;
+      `${headlineEt0.toFixed(2)}<span class="unit">mm/day</span>`;
     document.getElementById('etp-sub').textContent =
-      `For: ${periodLabel(etp.window_start, etp.window_end)}`;
+      `${methodLabel[headlineMethod]} · For: ${periodLabel(etp.window_start, etp.window_end)}`;
 
     const rows = [['Penman-Monteith (reference)', etp.et0_mm_per_day, 0]];
     for (const [key, val] of Object.entries(etp.et0_alt_mm_per_day || {})) {
@@ -1550,13 +1566,14 @@ async function refresh() {
   const tbody = document.getElementById('hist');
   tbody.innerHTML = hist.entries.length === 0
     ? '<tr><td colspan="3" style="color:#64748b">no history yet</td></tr>'
-    : hist.entries.map(e =>
-        `<tr>
+    : hist.entries.map(e => {
+        const headlineEt0 = e.et0_alt_mm_per_day?.fao56_estimated_sun ?? e.et0_mm_per_day;
+        return `<tr>
           <td>${periodLabel(e.window_start, e.window_end)}</td>
-          <td>${e.et0_mm_per_day.toFixed(3)}</td>
+          <td>${headlineEt0.toFixed(3)}</td>
           <td>${fmt(e.observation_count)}</td>
-        </tr>`
-      ).join('');
+        </tr>`;
+      }).join('');
 }
 
 function drawDailyChart(days) {
